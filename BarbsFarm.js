@@ -1,13 +1,26 @@
 /*
- * Script Name: Barbs Finder
- * Version: v2.0.2
- * Last Updated: 2025-08-15
- * Author: RedAlert
- * Author URL: https://twscripts.dev/
- * Author Contact: redalert_tw (Discord)
- * Approved: t13981993
- * Approved Date: 2020-05-27
- * Mod: JawJaw
+ * Script Name: Barbs Finder - ES Farm Intelligence (FORK)
+ * Fork Version: v2.1.0-ES-FORK
+ * Fork Date: 2026-07-28
+ * Original Project: Barbs Finder v2.0.2
+ * Original Author: RedAlert
+ * Original Author URL: https://twscripts.dev/
+ * Original Author Contact: redalert_tw (Discord)
+ * Original Approval: t13981993 (2020-05-27)
+ * Original Mod: JawJaw
+ *
+ * FORK NOTICE:
+ * This is a modified fork of the original approved Barbs Finder script.
+ * Changes in this fork include Spanish UI, default attack prefill of
+ * 1 scout + 10 light cavalry, and manual read-only analysis of the player's
+ * own attack reports to display the latest report date/time and scouted
+ * resources for barbarian villages.
+ *
+ * IMPORTANT: The original approval applies to the original script/version.
+ * This fork must not be assumed to be approved; submit this exact version
+ * to the relevant Tribal Wars support/script review process before use.
+ * The report analysis runs only after an explicit user click and this fork
+ * never submits or confirms attacks automatically.
  */
 
 /* Copyright (c) RedAlert
@@ -22,7 +35,7 @@ var scriptConfig = {
     scriptData: {
         prefix: 'barbsFinder',
         name: 'Barbs Finder',
-        version: 'v2.0.2-ES',
+        version: 'v2.1.0-ES-FORK',
         author: 'RedAlert',
         authorUrl: 'https://twscripts.dev/',
         helpLink:
@@ -49,6 +62,20 @@ var scriptConfig = {
             'Sequential Scout Script:': 'Sequential Scout Script:',
             Help: 'Help',
             'There was an error!': 'There was an error!',
+            'Update Reports': 'Update reports',
+            'Report pages:': 'Report pages:',
+            'Latest report': 'Latest report',
+            'Scouted resources': 'Scouted resources',
+            Status: 'Status',
+            'No report': 'No report',
+            'Resources detected': 'Resources detected',
+            'No resources': 'No resources',
+            'No scout data': 'No scout data',
+            'Filter barbarian villages first!': 'Filter barbarian villages first!',
+            'Reading reports...': 'Reading reports...',
+            'Reports updated.': 'Reports updated.',
+            'Could not read reports.': 'Could not read reports.',
+            'Open report': 'Open report',
         },
         es_ES: {
             'Barbs Finder': 'Buscador de bárbaros',
@@ -70,6 +97,20 @@ var scriptConfig = {
             'Sequential Scout Script:': 'Script secuencial de exploración:',
             Help: 'Ayuda',
             'There was an error!': '¡Se produjo un error!',
+            'Update Reports': 'Actualizar informes',
+            'Report pages:': 'Páginas de informes:',
+            'Latest report': 'Último ataque',
+            'Scouted resources': 'Recursos espiados',
+            Status: 'Estado',
+            'No report': 'Sin informe',
+            'Resources detected': 'Atacar: recursos detectados',
+            'No resources': 'No atacar: sin recursos',
+            'No scout data': 'Revisar: sin datos de espionaje',
+            'Filter barbarian villages first!': '¡Primero filtra las aldeas bárbaras!',
+            'Reading reports...': 'Leyendo informes...',
+            'Reports updated.': 'Informes actualizados.',
+            'Could not read reports.': 'No se pudieron leer los informes.',
+            'Open report': 'Ver informe',
         },
         sk_SK: {
             'Barbs Finder': 'HÄ¾adaÄ barbariek',
@@ -2112,6 +2153,11 @@ window.twSDK = {
 
     const { villages } = await fetchWorldData();
 
+    // Fork state: report information is kept only in memory for this page load.
+    // No polling, timers, background listeners or automatic attack actions are used.
+    let lastFilteredBarbs = [];
+    let reportIntelByCoord = {};
+
     // Entry point
     try {
         // build user interface
@@ -2120,6 +2166,7 @@ window.twSDK = {
         // register action handler
         handleFilterBarbs();
         handleResetFilters();
+        handleUpdateReports();
     } catch (error) {
         UI.ErrorMessage(twSDK.tt('There was an error!'));
         console.error(`${scriptInfo} Error:`, error);
@@ -2173,13 +2220,25 @@ window.twSDK = {
                         <input type="text" id="maxPoints" value="12154" class="ra-input">
                     </div>
                 </div>
-                <div class="ra-mb15">
+                <div class="ra-mb15 ra-actions-row">
                     <a href="javascript:void(0);" id="btnFilterBarbs" class="btn btn-confirm-yes">
                         ${twSDK.tt('Filter')}
                     </a>
                     <a href="javascript:void(0);" id="btnResetFilters" class="btn btn-confirm-no">
                         ${twSDK.tt('Reset')}
                     </a>
+                    <a href="javascript:void(0);" id="btnUpdateReports" class="btn">
+                        ${twSDK.tt('Update Reports')}
+                    </a>
+                    <label for="reportPages" class="ra-inline-label">${twSDK.tt(
+                        'Report pages:'
+                    )}</label>
+                    <select id="reportPages" class="ra-small-select">
+                        <option value="1">1</option>
+                        <option value="3" selected>3</option>
+                        <option value="5">5</option>
+                    </select>
+                    <span id="reportsStatus" class="ra-report-status"></span>
                 </div>
                 <div class="ra-mb15">
                     <strong>${twSDK.tt('Barbs found:')}</strong>
@@ -2210,6 +2269,14 @@ window.twSDK = {
                 .ra-grid-4 { grid-template-columns: 1fr 1fr 1fr 1fr; }
                 .btn-already-sent { padding: 3px; }
                 .already-sent-command { opacity: 0.6; }
+                .ra-actions-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+                .ra-inline-label { display: inline-block; margin: 0 0 0 6px; font-weight: 600; }
+                .ra-small-select { padding: 3px; width: auto; }
+                .ra-report-status { margin-left: 4px; font-weight: 600; }
+                .ra-status-good { color: #16830f; font-weight: 700; }
+                .ra-status-empty { color: #a33a19; font-weight: 700; }
+                .ra-status-neutral { color: #6b5a37; font-weight: 700; }
+                .ra-resources { white-space: nowrap; }
             `;
 
         twSDK.renderBoxWidget(
@@ -2261,27 +2328,73 @@ window.twSDK = {
                 let barbariansCount = barbariansCoordsArray.length;
                 let barbariansCoordsList = barbariansCoordsArray.join(' ');
                 let scoutScript = `javascript:coords='${barbariansCoordsList}';var doc=document;if(window.frames.length>0 && window.main!=null)doc=window.main.document;url=doc.URL;if(url.indexOf('screen=place')==-1)alert('¡Usa el script en la página de la plaza de reuniones!');coords=coords.split(' ');index=0;farmcookie=document.cookie.match('(^|;) ?farm=([^;]*)(;|$)');if(farmcookie!=null)index=parseInt(farmcookie[2]);if(index>=coords.length)alert('¡Se recorrieron todas las aldeas; ahora se reiniciará desde la primera!');if(index>=coords.length)index=0;coords=coords[index];coords=coords.split('|');index=index+1;cookie_date=new Date(2030,1,1);document.cookie ='farm='+index+';expires='+cookie_date.toGMTString();doc.forms[0].x.value=coords[0];doc.forms[0].y.value=coords[1];$('#place_target').find('input').val(coords[0]+'|'+coords[1]);doc.forms[0].spy.value=1;if(doc.forms[0].light)doc.forms[0].light.value=10;`;
+                // Keep the current result set so report analysis is always explicitly
+                // tied to the villages the player has just filtered.
+                lastFilteredBarbs = filteredByRadiusBarbs;
+                reportIntelByCoord = {};
+
                 let tableContent = generateBarbariansTable(
                     filteredByRadiusBarbs,
-                    currentVillage
+                    currentVillage,
+                    reportIntelByCoord
                 );
 
                 jQuery('#barbsCount').text(barbariansCount);
+                jQuery('#reportsStatus').text('');
                 jQuery('#barbCoordsList').text(barbariansCoordsList);
                 jQuery('#barbScoutScript').val(scoutScript);
                 jQuery('#barbariansTable').show();
                 jQuery('#barbariansTable').html(tableContent);
 
-                jQuery('.btn-send-attack').on('click', function (e) {
-                    jQuery(this).addClass('btn-confirm-yes btn-already-sent');
-                    jQuery(this)
-                        .parent()
-                        .parent()
-                        .addClass('already-sent-command');
-                });
+                bindAttackButtonVisualState();
             } else {
                 jQuery('#btnResetFilters').trigger('click');
                 UI.InfoMessage(twSDK.tt('No barbarian villages found!'));
+            }
+        });
+    }
+
+    // Action Handler: Manually read the player's own attack reports.
+    // This is intentionally user-triggered: no polling/background refresh is used.
+    function handleUpdateReports() {
+        jQuery('#btnUpdateReports').on('click', async function (e) {
+            e.preventDefault();
+
+            if (lastFilteredBarbs.length < 1) {
+                UI.InfoMessage(twSDK.tt('Filter barbarian villages first!'));
+                return;
+            }
+
+            const $button = jQuery(this);
+            if ($button.attr('aria-disabled') === 'true') return;
+
+            const pagesToScan = parseInt(jQuery('#reportPages').val(), 10) || 1;
+            const currentVillage = jQuery('#raCurrentVillage').val().trim();
+
+            $button.addClass('disabled').attr('aria-disabled', 'true');
+            jQuery('#reportsStatus').text(twSDK.tt('Reading reports...'));
+
+            try {
+                reportIntelByCoord = await fetchLatestReportIntel(
+                    lastFilteredBarbs,
+                    pagesToScan
+                );
+
+                const tableContent = generateBarbariansTable(
+                    lastFilteredBarbs,
+                    currentVillage,
+                    reportIntelByCoord
+                );
+
+                jQuery('#barbariansTable').html(tableContent).show();
+                bindAttackButtonVisualState();
+                jQuery('#reportsStatus').text(twSDK.tt('Reports updated.'));
+            } catch (error) {
+                console.error(`${scriptInfo} Report reader error:`, error);
+                jQuery('#reportsStatus').text(twSDK.tt('Could not read reports.'));
+                UI.ErrorMessage(twSDK.tt('Could not read reports.'));
+            } finally {
+                $button.removeClass('disabled').removeAttr('aria-disabled');
             }
         });
     }
@@ -2298,13 +2411,16 @@ window.twSDK = {
             jQuery('#barbsCount').text('0');
             jQuery('#barbCoordsList').text('');
             jQuery('#barbScoutScript').val('');
+            jQuery('#reportsStatus').text('');
+            lastFilteredBarbs = [];
+            reportIntelByCoord = {};
             jQuery('#barbariansTable').hide();
             jQuery('#barbariansTable').html('');
         });
     }
 
     // Generate Table
-    function generateBarbariansTable(barbs, currentVillage) {
+    function generateBarbariansTable(barbs, currentVillage, intelByCoord = {}) {
         if (barbs.length < 1) return;
 
         let barbariansWithDistance = [];
@@ -2319,7 +2435,7 @@ window.twSDK = {
             return a[7] - b[7];
         });
 
-        let tableRows = generateTableRows(barbariansWithDistance);
+        let tableRows = generateTableRows(barbariansWithDistance, intelByCoord);
 
         let tableContent = `
                 <table class="vis overview_table ra-table" width="100%">
@@ -2341,6 +2457,15 @@ window.twSDK = {
                                 ${twSDK.tt('Dist.')}
                             </th>
                             <th>
+                                ${twSDK.tt('Latest report')}
+                            </th>
+                            <th>
+                                ${twSDK.tt('Scouted resources')}
+                            </th>
+                            <th>
+                                ${twSDK.tt('Status')}
+                            </th>
+                            <th>
                                 ${twSDK.tt('Attack')}
                             </th>
                         </tr>
@@ -2355,12 +2480,18 @@ window.twSDK = {
     }
 
     // Generate Table Rows
-    function generateTableRows(barbs) {
+    function generateTableRows(barbs, intelByCoord = {}) {
         let renderTableRows = '';
 
         barbs.forEach((barb, index) => {
             index++;
-            let continent = barb[3].charAt(0) + barb[2].charAt(0);
+            const continent = barb[3].charAt(0) + barb[2].charAt(0);
+            const coord = `${barb[2]}|${barb[3]}`;
+            const intel = intelByCoord[coord];
+            const reportCell = renderLatestReportCell(intel);
+            const resourcesCell = renderResourcesCell(intel);
+            const statusCell = renderStatusCell(intel);
+
             renderTableRows += `
                     <tr>
                         <td class="ra-tac">
@@ -2373,11 +2504,14 @@ window.twSDK = {
                             <a href="game.php?screen=info_village&id=${
                                 barb[0]
                             }" target="_blank" rel="noopener noreferrer">
-                                ${barb[2]}|${barb[3]}
+                                ${coord}
                             </a>
                         </td>
                         <td>${twSDK.formatAsNumber(barb[5])}</td>
                         <td class="ra-tac">${barb[7].toFixed(2)}</td>
+                        <td class="ra-tac">${reportCell}</td>
+                        <td class="ra-tac ra-resources">${resourcesCell}</td>
+                        <td class="ra-tac">${statusCell}</td>
                         <td class="ra-tac">
                             <a href="/game.php?screen=place&target=${
                                 barb[0]
@@ -2390,6 +2524,364 @@ window.twSDK = {
         });
 
         return renderTableRows;
+    }
+
+    function renderLatestReportCell(intel) {
+        if (!intel) return twSDK.tt('No report');
+        const safeDate = escapeHtml(intel.dateText || twSDK.tt('Open report'));
+        if (!intel.url) return safeDate;
+        return `<a href="${escapeHtml(intel.url)}" target="_blank" rel="noopener noreferrer" title="${twSDK.tt(
+            'Open report'
+        )}">${safeDate}</a>`;
+    }
+
+    function renderResourcesCell(intel) {
+        if (!intel || !intel.resourcesKnown) return '—';
+        const { wood, stone, iron, total } = intel.resources;
+        return `${twSDK.formatAsNumber(wood)} / ${twSDK.formatAsNumber(
+            stone
+        )} / ${twSDK.formatAsNumber(iron)} (${twSDK.formatAsNumber(total)})`;
+    }
+
+    function renderStatusCell(intel) {
+        if (!intel) {
+            return `<span class="ra-status-neutral">${twSDK.tt('No report')}</span>`;
+        }
+        if (!intel.resourcesKnown) {
+            return `<span class="ra-status-neutral">${twSDK.tt(
+                'No scout data'
+            )}</span>`;
+        }
+        if (intel.resources.total > 0) {
+            return `<span class="ra-status-good">${twSDK.tt(
+                'Resources detected'
+            )}</span>`;
+        }
+        return `<span class="ra-status-empty">${twSDK.tt('No resources')}</span>`;
+    }
+
+    function bindAttackButtonVisualState() {
+        jQuery('.btn-send-attack')
+            .off('click.barbsFinderFork')
+            .on('click.barbsFinderFork', function () {
+                // Visual marker only. The browser still opens the normal rally point
+                // and the player must perform the game's normal attack flow manually.
+                jQuery(this).addClass('btn-confirm-yes btn-already-sent');
+                jQuery(this).closest('tr').addClass('already-sent-command');
+            });
+    }
+
+    // Read-only report intelligence. The player must explicitly click
+    // "Actualizar informes". Only same-origin Tribal Wars pages are requested.
+    async function fetchLatestReportIntel(barbs, pagesToScan) {
+        const targetCoords = new Set(
+            barbs.map((barb) => `${barb[2]}|${barb[3]}`)
+        );
+        const latestByCoord = {};
+        let foundAnyReportPage = false;
+
+        for (let page = 0; page < pagesToScan; page++) {
+            const reportUrl = buildReportOverviewUrl(page);
+            const html = await jQuery.ajax({
+                url: reportUrl,
+                method: 'GET',
+                dataType: 'html',
+            });
+
+            const entries = parseAttackReportOverview(html, targetCoords);
+            if (entries.length > 0) foundAnyReportPage = true;
+
+            // Report overviews are normally newest first. Keep only the first
+            // matching report for each barbarian coordinate.
+            entries.forEach((entry) => {
+                if (!latestByCoord[entry.coord]) {
+                    latestByCoord[entry.coord] = entry;
+                }
+            });
+
+            // If a later page returns no report links at all, stop requesting pages.
+            if (page > 0 && !hasReportViewLinks(html)) break;
+            await sleep(250);
+        }
+
+        if (!foundAnyReportPage && Object.keys(latestByCoord).length === 0) {
+            return {};
+        }
+
+        // Fetch one detail page per matched coordinate, sequentially and with a
+        // delay to avoid burst traffic. These GET requests only read the user's
+        // own report pages and never trigger game actions.
+        for (const coord of Object.keys(latestByCoord)) {
+            const entry = latestByCoord[coord];
+            if (!entry.url) continue;
+
+            try {
+                await sleep(250);
+                const reportHtml = await jQuery.ajax({
+                    url: entry.url,
+                    method: 'GET',
+                    dataType: 'html',
+                });
+                const resources = extractScoutedResources(reportHtml);
+                if (resources) {
+                    entry.resources = resources;
+                    entry.resourcesKnown = true;
+                } else {
+                    entry.resources = { wood: 0, stone: 0, iron: 0, total: 0 };
+                    entry.resourcesKnown = false;
+                }
+            } catch (error) {
+                console.warn(
+                    `${scriptInfo} Could not read report for ${coord}:`,
+                    error
+                );
+                entry.resourcesKnown = false;
+            }
+        }
+
+        return latestByCoord;
+    }
+
+    function buildReportOverviewUrl(page) {
+        // link_base_pure normally ends in "screen="; appending report preserves
+        // the active village/session/sitter context supplied by the game.
+        let url = `${game_data.link_base_pure}report&mode=attack`;
+        if (page > 0) url += `&page=${page}`;
+        return url;
+    }
+
+    function hasReportViewLinks(html) {
+        const doc = parseHtmlDocument(html);
+        return jQuery(doc).find('a[href*="screen=report"][href*="view="]').length > 0;
+    }
+
+    function parseAttackReportOverview(html, targetCoords) {
+        const doc = parseHtmlDocument(html);
+        const entries = [];
+        const seenUrls = new Set();
+
+        jQuery(doc)
+            .find('a[href*="screen=report"][href*="view="]')
+            .each(function () {
+                const $link = jQuery(this);
+                const href = $link.attr('href');
+                if (!href || seenUrls.has(href)) return;
+
+                const $row = $link.closest('tr');
+                const searchableText = normalizeSpaces(
+                    ($row.length ? $row.text() : $link.text()) || ''
+                );
+                const coords = searchableText.match(/\d{1,3}\|\d{1,3}/g) || [];
+                const coord = coords.find((item) => targetCoords.has(item));
+                if (!coord) return;
+
+                seenUrls.add(href);
+                entries.push({
+                    coord,
+                    url: absoluteGameUrl(href),
+                    dateText: extractDateTextFromReportRow($row),
+                    resourcesKnown: false,
+                    resources: { wood: 0, stone: 0, iron: 0, total: 0 },
+                });
+            });
+
+        return entries;
+    }
+
+    function extractDateTextFromReportRow($row) {
+        if (!$row || !$row.length) return '';
+
+        // Prefer explicit title/data attributes used by some game layouts.
+        const attributed = $row
+            .find('[data-time], [data-timestamp], [title]')
+            .map(function () {
+                return (
+                    jQuery(this).attr('data-time') ||
+                    jQuery(this).attr('data-timestamp') ||
+                    jQuery(this).attr('title') ||
+                    ''
+                );
+            })
+            .get()
+            .find((value) => looksLikeDateTime(value));
+        if (attributed) return normalizeReportDateText(attributed);
+
+        const cellTexts = $row
+            .find('td')
+            .map(function () {
+                return normalizeSpaces(jQuery(this).text());
+            })
+            .get()
+            .filter(Boolean)
+            .reverse();
+
+        const matchingCell = cellTexts.find((value) => looksLikeDateTime(value));
+        return normalizeReportDateText(matchingCell || cellTexts[0] || '');
+    }
+
+    function normalizeReportDateText(value) {
+        const text = normalizeSpaces(value);
+        if (!text) return '';
+
+        const timeMatch = text.match(/(\d{1,2}:\d{2}(?::\d{2})?)/);
+        if (!timeMatch) return text;
+
+        if (/\bhoy\b|\btoday\b/i.test(text)) {
+            const now = twSDK.getServerDateTimeObject();
+            return `${twSDK.zeroPad(now.getDate(), 2)}/${twSDK.zeroPad(
+                now.getMonth() + 1,
+                2
+            )}/${now.getFullYear()} ${timeMatch[1]}`;
+        }
+
+        if (/\bayer\b|\byesterday\b/i.test(text)) {
+            const yesterday = twSDK.getServerDateTimeObject();
+            yesterday.setDate(yesterday.getDate() - 1);
+            return `${twSDK.zeroPad(yesterday.getDate(), 2)}/${twSDK.zeroPad(
+                yesterday.getMonth() + 1,
+                2
+            )}/${yesterday.getFullYear()} ${timeMatch[1]}`;
+        }
+
+        return text;
+    }
+
+    function looksLikeDateTime(value) {
+        if (!value) return false;
+        return /(?:\d{1,2}[\/.\-]\d{1,2}(?:[\/.\-]\d{2,4})?|\bhoy\b|\bayer\b|\btoday\b|\byesterday\b).*?\d{1,2}:\d{2}|\d{1,2}:\d{2}(?::\d{2})?/i.test(
+            value
+        );
+    }
+
+    function extractScoutedResources(html) {
+        const doc = parseHtmlDocument(html);
+        const $doc = jQuery(doc);
+        let bestCandidate = null;
+
+        $doc.find('tr').each(function () {
+            const $row = jQuery(this);
+            const label = normalizeSpaces(
+                $row.find('th, td').first().text() || $row.text()
+            ).toLowerCase();
+
+            // Loot/plunder is what the attack carried home, not the resources
+            // remaining in the village after successful scouting.
+            if (/bot[ií]n|saque|loot|plunder|recursos saqueados/.test(label)) {
+                return;
+            }
+
+            const resources = extractResourcesFromContainer($row);
+            if (!resources) return;
+
+            let score = 1;
+            if (/espi|explor|scout|recursos.*(?:aldea|pueblo|encontr|restant|dispon)/.test(label)) {
+                score = 10;
+            }
+
+            if (!bestCandidate || score > bestCandidate.score) {
+                bestCandidate = { score, resources };
+            }
+        });
+
+        // Fallback for layouts where the resource line is not wrapped in a table row.
+        if (!bestCandidate) {
+            const resources = extractResourcesFromContainer($doc);
+            if (resources) bestCandidate = { score: 1, resources };
+        }
+
+        return bestCandidate ? bestCandidate.resources : null;
+    }
+
+    function extractResourcesFromContainer($container) {
+        const aliases = {
+            wood: ['wood', 'holz'],
+            stone: ['stone', 'clay', 'lehm'],
+            iron: ['iron', 'eisen'],
+        };
+        const result = {};
+
+        for (const [resource, names] of Object.entries(aliases)) {
+            let $icon = jQuery();
+
+            for (const name of names) {
+                $icon = $container
+                    .find(
+                        `span.icon.${name}, span.${name}, .icon.header.${name}, img[src*="${name}"]`
+                    )
+                    .first();
+                if ($icon.length) break;
+            }
+
+            if (!$icon.length) return null;
+            const amount = readNumberFollowingElement($icon[0]);
+            if (amount === null) return null;
+            result[resource] = amount;
+        }
+
+        result.total = result.wood + result.stone + result.iron;
+        return result;
+    }
+
+    function readNumberFollowingElement(element) {
+        let node = element.nextSibling;
+        let collected = '';
+
+        while (node) {
+            if (node.nodeType === 1 && isResourceIcon(node)) break;
+            collected += ` ${node.textContent || ''}`;
+            const number = parseGameNumber(collected);
+            if (number !== null) return number;
+            node = node.nextSibling;
+        }
+
+        // Some layouts wrap the icon and amount in a small container.
+        const parentText = element.parentNode ? element.parentNode.textContent : '';
+        return parseGameNumber(parentText);
+    }
+
+    function isResourceIcon(node) {
+        if (!node || node.nodeType !== 1) return false;
+        const descriptor = `${node.className || ''} ${node.getAttribute('src') || ''}`.toLowerCase();
+        return /(?:wood|holz|stone|clay|lehm|iron|eisen)/.test(descriptor);
+    }
+
+    function parseGameNumber(value) {
+        if (!value) return null;
+        const match = String(value).match(/\d[\d.\s,]*/);
+        if (!match) return null;
+        const digits = match[0].replace(/[^\d]/g, '');
+        return digits.length ? parseInt(digits, 10) : null;
+    }
+
+    function parseHtmlDocument(html) {
+        return new DOMParser().parseFromString(String(html || ''), 'text/html');
+    }
+
+    function absoluteGameUrl(href) {
+        try {
+            return new URL(href, window.location.origin).toString();
+        } catch (error) {
+            return href;
+        }
+    }
+
+    function normalizeSpaces(value) {
+        return String(value || '')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    function escapeHtml(value) {
+        return String(value ?? '')
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#039;');
+    }
+
+    function sleep(ms) {
+        return new Promise((resolve) => setTimeout(resolve, ms));
     }
 
     // Helper: Fetch all required world data
