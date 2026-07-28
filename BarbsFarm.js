@@ -1,6 +1,6 @@
 /*
  * Script Name: Barbs Finder - ES Farm Intelligence (FORK)
- * Fork Version: v2.1.0-ES-FORK
+ * Fork Version: v2.2.0-ES-FORK
  * Fork Date: 2026-07-28
  * Original Project: Barbs Finder v2.0.2
  * Original Author: RedAlert
@@ -15,6 +15,7 @@
  * 1 scout + 10 light cavalry, and manual read-only analysis of the player's
  * own attack reports to display the latest report date/time and scouted
  * resources for barbarian villages.
+ * v2.2.0 adds non-overlapping distance ranges: 0-10, >10-20, ... >90-100.
  *
  * IMPORTANT: The original approval applies to the original script/version.
  * This fork must not be assumed to be approved; submit this exact version
@@ -35,7 +36,7 @@ var scriptConfig = {
     scriptData: {
         prefix: 'barbsFinder',
         name: 'Barbs Finder',
-        version: 'v2.1.0-ES-FORK',
+        version: 'v2.2.0-ES-FORK',
         author: 'RedAlert',
         authorUrl: 'https://twscripts.dev/',
         helpLink:
@@ -2189,22 +2190,16 @@ window.twSDK = {
                             'Radius:'
                         )}</label>
                         <select id="radius_choser" class="ra-input">
-                            <option value="10">10</option>
-                            <option value="20">20</option>
-                            <option value="30">30</option>
-                            <option value="40">40</option>
-                            <option value="50" selected>50</option>
-                            <option value="60">60</option>
-                            <option value="70">70</option>
-                            <option value="80">80</option>
-                            <option value="90">90</option>
-                            <option value="100">100</option>
-                            <option value="110">110</option>
-                            <option value="120">120</option>
-                            <option value="130">130</option>
-                            <option value="140">140</option>
-                            <option value="150">150</option>
-                            <option value="999">999</option>
+                            <option value="0|10" selected>0 - 10</option>
+                            <option value="10|20">11 - 20</option>
+                            <option value="20|30">21 - 30</option>
+                            <option value="30|40">31 - 40</option>
+                            <option value="40|50">41 - 50</option>
+                            <option value="50|60">51 - 60</option>
+                            <option value="60|70">61 - 70</option>
+                            <option value="70|80">71 - 80</option>
+                            <option value="80|90">81 - 90</option>
+                            <option value="90|100">91 - 100</option>
                         </select>
                     </div>
                     <div class="ra-mb15">
@@ -2295,7 +2290,10 @@ window.twSDK = {
             const currentVillage = $('#raCurrentVillage').val().trim();
             const minPoints = parseInt($('#minPoints').val().trim());
             const maxPoints = parseInt($('#maxPoints').val().trim());
-            const radius = parseInt($('#radius_choser').val());
+            const [radiusMin, radiusMax] = $('#radius_choser')
+                .val()
+                .split('|')
+                .map(Number);
 
             const barbarians = villages.filter(
                 (village) => parseInt(village[4]) === 0
@@ -2309,16 +2307,22 @@ window.twSDK = {
                 );
             });
 
-            // Filter by radius
+            // Filter by non-overlapping distance range.
+            // First range: 0 <= distance <= 10.
+            // Following ranges: previous limit < distance <= current limit.
+            // This avoids repeating villages when switching from 0-10 to 11-20, etc.
             const filteredByRadiusBarbs = filteredBarbs.filter((barbarian) => {
-                let barbCoord = barbarian[2] + '|' + barbarian[3];
-                let distance = twSDK.calculateDistance(
+                const barbCoord = barbarian[2] + '|' + barbarian[3];
+                const distance = twSDK.calculateDistance(
                     currentVillage,
                     barbCoord
                 );
-                if (distance <= radius) {
-                    return barbarian;
+
+                if (radiusMin === 0) {
+                    return distance >= radiusMin && distance <= radiusMax;
                 }
+
+                return distance > radiusMin && distance <= radiusMax;
             });
 
             if (filteredByRadiusBarbs.length > 0) {
@@ -2407,7 +2411,7 @@ window.twSDK = {
             jQuery('#raCurrentVillage').val(game_data.village.coord);
             jQuery('#minPoints').val(26);
             jQuery('#maxPoints').val(12154);
-            jQuery('#radius_choser').val('20');
+            jQuery('#radius_choser').val('0|10');
             jQuery('#barbsCount').text('0');
             jQuery('#barbCoordsList').text('');
             jQuery('#barbScoutScript').val('');
