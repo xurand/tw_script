@@ -1,6 +1,6 @@
 /*
  * Script Name: Barbs Finder - ES Farm Intelligence (FORK)
- * Fork Version: v2.3.0-ES-FORK
+ * Fork Version: v2.4.0-ES-FORK
  * Fork Date: 2026-07-28
  * Original Project: Barbs Finder v2.0.2
  * Original Author: RedAlert
@@ -11,14 +11,17 @@
  *
  * FORK NOTICE:
  * This is a modified fork of the original approved Barbs Finder script.
- * Changes in this fork include Spanish UI, default attack prefill of
- * 1 scout + 10 light cavalry, and manual read-only analysis of the player's
+ * Changes in this fork include Spanish UI, dynamic attack prefill of
+ * 1 scout + the light cavalry needed for the scouted resources, and manual
+ * read-only analysis of the player's
  * own attack reports to display the latest report date/time and scouted
  * resources for barbarian villages.
  * v2.2.0 adds non-overlapping distance ranges: 0-10, >10-20, ... >90-100.
  * v2.3.0 improves report reading: scans every report-list page, parses the
  * real #report_list rows, deduplicates report IDs, and distinguishes
  * confirmed zero resources from unavailable scouting data.
+ * v2.4.0 calculates light cavalry dynamically from scouted resources using
+ * 80 carrying capacity per light cavalry; 1 scout remains fixed.
  *
  * IMPORTANT: The original approval applies to the original script/version.
  * This fork must not be assumed to be approved; submit this exact version
@@ -39,7 +42,7 @@ var scriptConfig = {
     scriptData: {
         prefix: 'barbsFinder',
         name: 'Barbs Finder',
-        version: 'v2.3.0-ES-FORK',
+        version: 'v2.4.0-ES-FORK',
         author: 'RedAlert',
         authorUrl: 'https://twscripts.dev/',
         helpLink:
@@ -70,6 +73,7 @@ var scriptConfig = {
             'Report pages:': 'Report pages:',
             'Latest report': 'Latest report',
             'Scouted resources': 'Scouted resources',
+            'Light cavalry': 'Light cavalry',
             Status: 'Status',
             'No report': 'No report',
             'Resources detected': 'Resources detected',
@@ -108,6 +112,7 @@ var scriptConfig = {
             'Report pages:': 'Páginas de informes:',
             'Latest report': 'Último ataque',
             'Scouted resources': 'Recursos espiados',
+            'Light cavalry': 'Ligeras',
             Status: 'Estado',
             'No report': 'Sin informe',
             'Resources detected': 'Atacar: recursos detectados',
@@ -2168,6 +2173,10 @@ window.twSDK = {
     let lastFilteredBarbs = [];
     let reportIntelByCoord = {};
 
+    // Official standard carrying capacity of one light cavalry.
+    // Scout carrying capacity is 0, so the fixed scout does not affect the calculation.
+    const LIGHT_CARRY_CAPACITY = 80;
+
     // Entry point
     try {
         // build user interface
@@ -2335,7 +2344,10 @@ window.twSDK = {
                 );
                 let barbariansCount = barbariansCoordsArray.length;
                 let barbariansCoordsList = barbariansCoordsArray.join(' ');
-                let scoutScript = `javascript:coords='${barbariansCoordsList}';var doc=document;if(window.frames.length>0 && window.main!=null)doc=window.main.document;url=doc.URL;if(url.indexOf('screen=place')==-1)alert('¡Usa el script en la página de la plaza de reuniones!');coords=coords.split(' ');index=0;farmcookie=document.cookie.match('(^|;) ?farm=([^;]*)(;|$)');if(farmcookie!=null)index=parseInt(farmcookie[2]);if(index>=coords.length)alert('¡Se recorrieron todas las aldeas; ahora se reiniciará desde la primera!');if(index>=coords.length)index=0;coords=coords[index];coords=coords.split('|');index=index+1;cookie_date=new Date(2030,1,1);document.cookie ='farm='+index+';expires='+cookie_date.toGMTString();doc.forms[0].x.value=coords[0];doc.forms[0].y.value=coords[1];$('#place_target').find('input').val(coords[0]+'|'+coords[1]);doc.forms[0].spy.value=1;if(doc.forms[0].light)doc.forms[0].light.value=10;`;
+                const scoutScript = generateSequentialScoutScript(
+                    filteredByRadiusBarbs,
+                    reportIntelByCoord
+                );
                 // Keep the current result set so report analysis is always explicitly
                 // tied to the villages the player has just filtered.
                 lastFilteredBarbs = filteredByRadiusBarbs;
@@ -2393,6 +2405,12 @@ window.twSDK = {
                 );
 
                 jQuery('#barbariansTable').html(tableContent).show();
+                jQuery('#barbScoutScript').val(
+                    generateSequentialScoutScript(
+                        lastFilteredBarbs,
+                        reportIntelByCoord
+                    )
+                );
                 bindAttackButtonVisualState();
                 jQuery('#reportsStatus').text(twSDK.tt('Reports updated.'));
             } catch (error) {
@@ -2469,6 +2487,9 @@ window.twSDK = {
                                 ${twSDK.tt('Scouted resources')}
                             </th>
                             <th>
+                                ${twSDK.tt('Light cavalry')}
+                            </th>
+                            <th>
                                 ${twSDK.tt('Status')}
                             </th>
                             <th>
@@ -2496,6 +2517,7 @@ window.twSDK = {
             const intel = intelByCoord[coord];
             const reportCell = renderLatestReportCell(intel);
             const resourcesCell = renderResourcesCell(intel);
+            const lightNeeded = calculateLightCavalryNeeded(intel);
             const statusCell = renderStatusCell(intel);
 
             renderTableRows += `
@@ -2517,11 +2539,12 @@ window.twSDK = {
                         <td class="ra-tac">${barb[7].toFixed(2)}</td>
                         <td class="ra-tac">${reportCell}</td>
                         <td class="ra-tac ra-resources">${resourcesCell}</td>
+                        <td class="ra-tac"><strong>${lightNeeded}</strong></td>
                         <td class="ra-tac">${statusCell}</td>
                         <td class="ra-tac">
                             <a href="/game.php?screen=place&target=${
                                 barb[0]
-                            }&spy=1&light=10" target="_blank" rel="noopener noreferrer" class="btn btn-send-attack">
+                            }&spy=1&light=${lightNeeded}" target="_blank" rel="noopener noreferrer" class="btn btn-send-attack" title="1 espía + ${lightNeeded} ligeras">
                                 ${twSDK.tt('Attack')}
                             </a>
                         </td>
@@ -2530,6 +2553,40 @@ window.twSDK = {
         });
 
         return renderTableRows;
+    }
+
+
+    function calculateLightCavalryNeeded(intel) {
+        if (
+            !intel ||
+            !intel.resourcesKnown ||
+            !intel.resources ||
+            !Number.isFinite(Number(intel.resources.total))
+        ) {
+            return 0;
+        }
+
+        const totalResources = Math.max(0, Number(intel.resources.total));
+
+        if (totalResources === 0) {
+            return 0;
+        }
+
+        return Math.ceil(totalResources / LIGHT_CARRY_CAPACITY);
+    }
+
+    function generateSequentialScoutScript(barbs, intelByCoord = {}) {
+        const targets = barbs.map((barb) => {
+            const coord = `${barb[2]}|${barb[3]}`;
+            const lightNeeded = calculateLightCavalryNeeded(
+                intelByCoord[coord]
+            );
+            return `${coord}:${lightNeeded}`;
+        });
+
+        const targetsString = targets.join(' ');
+
+        return `javascript:targets='${targetsString}';var doc=document;if(window.frames.length>0&&window.main!=null)doc=window.main.document;url=doc.URL;if(url.indexOf('screen=place')==-1)alert('¡Usa el script en la página de la plaza de reuniones!');targets=targets.split(' ');index=0;farmcookie=document.cookie.match('(^|;) ?farm=([^;]*)(;|$)');if(farmcookie!=null)index=parseInt(farmcookie[2]);if(index>=targets.length)alert('¡Se recorrieron todas las aldeas; ahora se reiniciará desde la primera!');if(index>=targets.length)index=0;target=targets[index].split(':');coords=target[0].split('|');lights=parseInt(target[1],10)||0;index=index+1;cookie_date=new Date(2030,1,1);document.cookie='farm='+index+';expires='+cookie_date.toGMTString();doc.forms[0].x.value=coords[0];doc.forms[0].y.value=coords[1];$('#place_target').find('input').val(coords[0]+'|'+coords[1]);doc.forms[0].spy.value=1;if(doc.forms[0].light)doc.forms[0].light.value=lights;`;
     }
 
     function renderLatestReportCell(intel) {
