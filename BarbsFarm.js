@@ -1,6 +1,6 @@
 /*
  * Script Name: Barbs Finder - ES Farm Intelligence (FORK)
- * Fork Version: v2.4.1-ES-FORK
+ * Fork Version: v2.5.0-ES-FORK
  * Fork Date: 2026-07-28
  * Original Project: Barbs Finder v2.0.2
  * Original Author: RedAlert
@@ -23,6 +23,8 @@
  * v2.4.0 calculates light cavalry dynamically from scouted resources using
  * 80 carrying capacity per light cavalry; 1 scout remains fixed.
  * v2.4.1 shows the latest attack as relative elapsed time (e.g. "hace 12 min").
+ * v2.5.0 fixes report pagination by following Tribal Wars real "from=" offsets
+ * (e.g. from=100, from=200) and discovering pagination links dynamically.
  *
  * IMPORTANT: The original approval applies to the original script/version.
  * This fork must not be assumed to be approved; submit this exact version
@@ -43,7 +45,7 @@ var scriptConfig = {
     scriptData: {
         prefix: 'barbsFinder',
         name: 'Barbs Finder',
-        version: 'v2.4.1-ES-FORK',
+        version: 'v2.5.0-ES-FORK',
         author: 'RedAlert',
         authorUrl: 'https://twscripts.dev/',
         helpLink:
@@ -2413,7 +2415,8 @@ window.twSDK = {
                     )
                 );
                 bindAttackButtonVisualState();
-                jQuery('#reportsStatus').text(twSDK.tt('Reports updated.'));
+                // fetchLatestReportIntel already leaves a detailed final status
+                // with pages, reports scanned and matched villages.
             } catch (error) {
                 console.error(`${scriptInfo} Report reader error:`, error);
                 jQuery('#reportsStatus').text(twSDK.tt('Could not read reports.'));
@@ -2774,16 +2777,33 @@ window.twSDK = {
         );
         const latestByCoord = {};
         const seenReportIds = new Set();
+        const visitedOffsets = new Set();
+        const pendingOffsets = [0];
 
-        // Safety guard only. In normal use the loop stops as soon as the server
-        // returns an empty page or repeats the previous page.
+        // Safety guard only. Normal execution stops at the last discovered page.
         const MAX_REPORT_PAGES = 200;
+        let detectedPageSize = 0;
+        let pagesScanned = 0;
+        let activeFilterSummary = '';
 
-        for (let page = 0; page < MAX_REPORT_PAGES; page++) {
-            const reportUrl = buildReportOverviewUrl(page);
+        while (
+            pendingOffsets.length > 0 &&
+            visitedOffsets.size < MAX_REPORT_PAGES
+        ) {
+            // Always process offsets in chronological page order:
+            // 0, 100, 200, 300...
+            pendingOffsets.sort((a, b) => a - b);
+            const offset = pendingOffsets.shift();
+
+            if (visitedOffsets.has(offset)) continue;
+            visitedOffsets.add(offset);
+
+            const reportUrl = buildReportOverviewUrl(offset);
 
             jQuery('#reportsStatus').text(
-                `${twSDK.tt('Reading report page')} ${page + 1}...`
+                `${twSDK.tt('Reading report page')} ${
+                    pagesScanned + 1
+                } (${offset === 0 ? 'from=0' : `from=${offset}`})...`
             );
 
             const html = await jQuery.ajax({
@@ -2792,33 +2812,94 @@ window.twSDK = {
                 dataType: 'html',
             });
 
-            const pageData = parseAttackReportOverview(html, targetCoords);
+            pagesScanned++;
 
-            // No report rows means we reached the end.
-            if (pageData.reportIds.length === 0) {
-                break;
+            if (!activeFilterSummary) {
+                activeFilterSummary = detectActiveReportFilters(html);
             }
 
-            // If page=N is ignored by the server and the same report page is
-            // returned again, stop instead of looping indefinitely.
+            const pageData = parseAttackReportOverview(html, targetCoords);
+
+            // A truly empty report page means there is nothing else to process.
+            if (pageData.reportIds.length === 0) {
+                continue;
+            }
+
+            // Detect the actual report-page size from the real pagination links.
+            // On the user's server with 100 reports/page this resolves to 100.
+            if (!detectedPageSize) {
+                detectedPageSize = detectReportPageSize(html);
+                if (!detectedPageSize) {
+                    detectedPageSize = pageData.reportIds.length;
+                }
+            }
+
+            // Discover every real page URL exposed by Tribal Wars.
+            // The server uses "from=100", "from=200", ... rather than page=1/2.
+            const discoveredOffsets = extractReportPageOffsets(html);
+            discoveredOffsets.forEach((nextOffset) => {
+                if (
+                    !visitedOffsets.has(nextOffset) &&
+                    !pendingOffsets.includes(nextOffset)
+                ) {
+                    pendingOffsets.push(nextOffset);
+                }
+            });
+
+            // Extra fallback: if this is a full page, infer the next offset.
+            // This also works if the pagination control only exposes a subset
+            // of pages in very large report histories.
+            if (
+                detectedPageSize > 0 &&
+                pageData.reportIds.length >= detectedPageSize
+            ) {
+                const inferredNextOffset = offset + detectedPageSize;
+                if (
+                    !visitedOffsets.has(inferredNextOffset) &&
+                    !pendingOffsets.includes(inferredNextOffset)
+                ) {
+                    pendingOffsets.push(inferredNextOffset);
+                }
+            }
+
+            // If the server ignored an offset and returned a page containing
+            // only already-seen report IDs, do not infer another page from it.
             const newReportIds = pageData.reportIds.filter(
                 (reportId) => !seenReportIds.has(reportId)
             );
-            if (page > 0 && newReportIds.length === 0) {
-                break;
-            }
 
             pageData.reportIds.forEach((reportId) =>
                 seenReportIds.add(reportId)
             );
 
-            // The report list is newest first. Therefore the first occurrence of
-            // a target coordinate is its latest report; older pages cannot replace it.
-            pageData.entries.forEach((entry) => {
-                if (!latestByCoord[entry.coord]) {
-                    latestByCoord[entry.coord] = entry;
+            // Report pages are newest first. The first occurrence of a target
+            // coordinate is its latest report; older pages cannot replace it.
+            if (newReportIds.length > 0 || offset === 0) {
+                pageData.entries.forEach((entry) => {
+                    if (!latestByCoord[entry.coord]) {
+                        latestByCoord[entry.coord] = entry;
+                    }
+                });
+            }
+
+            // If this page is shorter than the configured page size it is the
+            // last page; remove any inferred offsets beyond it, while keeping
+            // real offsets that were explicitly found in the HTML.
+            if (
+                detectedPageSize > 0 &&
+                pageData.reportIds.length < detectedPageSize
+            ) {
+                const explicitOffsets = new Set(discoveredOffsets);
+                for (let i = pendingOffsets.length - 1; i >= 0; i--) {
+                    const candidate = pendingOffsets[i];
+                    if (
+                        candidate > offset &&
+                        !explicitOffsets.has(candidate)
+                    ) {
+                        pendingOffsets.splice(i, 1);
+                    }
                 }
-            });
+            }
 
             await sleep(250);
         }
@@ -2826,16 +2907,18 @@ window.twSDK = {
         const coordsToRead = Object.keys(latestByCoord);
         let detailIndex = 0;
 
-        // Only open one detail report per matched barbarian: the latest one.
-        // This keeps the number of requests low even when the report history
-        // contains hundreds or thousands of rows.
+        // Only open the latest report for each matched barbarian.
         for (const coord of coordsToRead) {
             const entry = latestByCoord[coord];
             if (!entry.url) continue;
 
             detailIndex++;
             jQuery('#reportsStatus').text(
-                `${twSDK.tt('Opening latest reports')} ${detailIndex}/${coordsToRead.length}...`
+                `${twSDK.tt('Opening latest reports')} ${detailIndex}/${
+                    coordsToRead.length
+                } · ${twSDK.tt('Reports scanned')}: ${
+                    seenReportIds.size
+                }`
             );
 
             try {
@@ -2852,10 +2935,6 @@ window.twSDK = {
                     entry.resources = resources;
                     entry.resourcesKnown = true;
                 } else if (entry.hasSpy && entry.lootExhausted) {
-                    // The report-list indicator "Saqueo parcial: ... saquearon
-                    // todo lo que encontraron" confirms that the village was
-                    // emptied by this attack. Even if the detail page omits a
-                    // 0/0/0 resource row, the useful farm state is known: 0.
                     entry.resources = {
                         wood: 0,
                         stone: 0,
@@ -2881,22 +2960,109 @@ window.twSDK = {
             }
         }
 
+        const finalStatusParts = [
+            `${twSDK.tt('Reports scanned')}: ${seenReportIds.size}`,
+            `${twSDK.tt('Matched villages')}: ${coordsToRead.length}`,
+            `${pagesScanned} pág.`,
+        ];
+
+        if (activeFilterSummary) {
+            finalStatusParts.push(
+                `${twSDK.tt('Active report filters')}: ${activeFilterSummary}`
+            );
+        }
+
+        jQuery('#reportsStatus').text(finalStatusParts.join(' · '));
+
         return latestByCoord;
     }
 
-    function buildReportOverviewUrl(page) {
-        // Use the same report mode visible in the game's current report list.
-        // The user's "reports per page" preference remains active because these
-        // requests reuse the same browser session/cookies.
-        let url = `${game_data.link_base_pure}report&mode=all&group_id=-1`;
+    function buildReportOverviewUrl(offset = 0) {
+        // The actual Tribal Wars report pagination uses "from=", not "page=".
+        // Use mode=all so the parser sees the same report list structure as the
+        // normal overview. Existing in-game report filters may still apply,
+        // therefore they are detected and shown to the user in the status text.
+        let url = `${game_data.link_base_pure}report&mode=all`;
 
-        // Page 0 is represented by the normal overview URL. Following pages use
-        // Tribal Wars' zero-based page parameter (page=1 is the second page).
-        if (page > 0) {
-            url += `&page=${page}`;
+        if (offset > 0) {
+            url += `&from=${offset}`;
         }
 
         return url;
+    }
+
+    function extractReportPageOffsets(html) {
+        const doc = parseHtmlDocument(html);
+        const offsets = new Set([0]);
+
+        jQuery(doc)
+            .find('a.paged-nav-item[href*="from="]')
+            .each(function () {
+                const href = jQuery(this).attr('href');
+                const value = parseInt(
+                    getQueryParameterFromUrl(href, 'from'),
+                    10
+                );
+
+                if (Number.isFinite(value) && value >= 0) {
+                    offsets.add(value);
+                }
+            });
+
+        return [...offsets].sort((a, b) => a - b);
+    }
+
+    function detectReportPageSize(html) {
+        const offsets = extractReportPageOffsets(html).filter(
+            (offset) => offset > 0
+        );
+
+        if (offsets.length > 0) {
+            return offsets[0];
+        }
+
+        return 0;
+    }
+
+    function detectActiveReportFilters(html) {
+        const doc = parseHtmlDocument(html);
+        const $doc = jQuery(doc);
+        const filters = [];
+
+        const subject = normalizeSpaces(
+            $doc.find('#filter_subject').val() || ''
+        );
+        if (subject) {
+            filters.push(`título="${subject}"`);
+        }
+
+        if ($doc.find('#filter_current_village:checked').length) {
+            filters.push('pueblo actual');
+        }
+
+        if ($doc.find('#filter_max_loot:checked').length) {
+            filters.push('botín máximo');
+        }
+
+        if ($doc.find('#filter_own_reports:checked').length) {
+            filters.push('solo propios');
+        }
+
+        const checkedBattleFilters = $doc.find(
+            '#battle_filter_form input.report-filter-checkbox:checked'
+        ).length;
+        if (checkedBattleFilters > 0) {
+            filters.push('resultado de batalla');
+        }
+
+        const checkedIconFilters = $doc.find(
+            'input[name^="filter_attack_type"]:checked, input[name^="filter_icon["]:checked'
+        ).length;
+        if (checkedIconFilters > 0) {
+            filters.push('iconos');
+        }
+
+        return filters.join(', ');
     }
 
     function parseAttackReportOverview(html, targetCoords) {
