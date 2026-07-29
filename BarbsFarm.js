@@ -1,6 +1,6 @@
 /*
  * Script Name: Barbs Finder - ES Farm Intelligence (FORK)
- * Fork Version: v2.4.0-ES-FORK
+ * Fork Version: v2.4.1-ES-FORK
  * Fork Date: 2026-07-28
  * Original Project: Barbs Finder v2.0.2
  * Original Author: RedAlert
@@ -22,6 +22,7 @@
  * confirmed zero resources from unavailable scouting data.
  * v2.4.0 calculates light cavalry dynamically from scouted resources using
  * 80 carrying capacity per light cavalry; 1 scout remains fixed.
+ * v2.4.1 shows the latest attack as relative elapsed time (e.g. "hace 12 min").
  *
  * IMPORTANT: The original approval applies to the original script/version.
  * This fork must not be assumed to be approved; submit this exact version
@@ -42,7 +43,7 @@ var scriptConfig = {
     scriptData: {
         prefix: 'barbsFinder',
         name: 'Barbs Finder',
-        version: 'v2.4.0-ES-FORK',
+        version: 'v2.4.1-ES-FORK',
         author: 'RedAlert',
         authorUrl: 'https://twscripts.dev/',
         helpLink:
@@ -2591,11 +2592,142 @@ window.twSDK = {
 
     function renderLatestReportCell(intel) {
         if (!intel) return twSDK.tt('No report');
-        const safeDate = escapeHtml(intel.dateText || twSDK.tt('Open report'));
-        if (!intel.url) return safeDate;
-        return `<a href="${escapeHtml(intel.url)}" target="_blank" rel="noopener noreferrer" title="${twSDK.tt(
+
+        const originalDate = intel.dateText || '';
+        const relativeTime = formatRelativeReportTime(originalDate);
+        const safeText = escapeHtml(
+            relativeTime || originalDate || twSDK.tt('Open report')
+        );
+        const safeOriginalDate = escapeHtml(originalDate);
+
+        if (!intel.url) return safeText;
+
+        return `<a href="${escapeHtml(
+            intel.url
+        )}" target="_blank" rel="noopener noreferrer" title="${safeOriginalDate || twSDK.tt(
             'Open report'
-        )}">${safeDate}</a>`;
+        )}">${safeText}</a>`;
+    }
+
+    function formatRelativeReportTime(dateText) {
+        const reportDate = parseReportDate(dateText);
+        if (!reportDate) return '';
+
+        const now = twSDK.getServerDateTimeObject();
+        let diffSeconds = Math.floor((now.getTime() - reportDate.getTime()) / 1000);
+
+        // Small clock differences should still display as "ahora".
+        if (diffSeconds < 0 && diffSeconds > -120) {
+            diffSeconds = 0;
+        }
+
+        if (diffSeconds < 0) return '';
+        if (diffSeconds < 60) return 'hace menos de 1 min';
+
+        const minutes = Math.floor(diffSeconds / 60);
+        if (minutes < 60) return `hace ${minutes} min`;
+
+        const hours = Math.floor(minutes / 60);
+        if (hours < 24) return `hace ${hours} h`;
+
+        const days = Math.floor(hours / 24);
+        if (days < 30) {
+            return days === 1 ? 'hace 1 día' : `hace ${days} días`;
+        }
+
+        const months = Math.floor(days / 30);
+        if (days < 365) {
+            return months === 1 ? 'hace 1 mes' : `hace ${months} meses`;
+        }
+
+        const years = Math.floor(days / 365);
+        return years === 1 ? 'hace 1 año' : `hace ${years} años`;
+    }
+
+    function parseReportDate(value) {
+        const text = normalizeSpaces(value);
+        if (!text) return null;
+
+        const now = twSDK.getServerDateTimeObject();
+
+        // Normalized format used by this fork: DD/MM/YYYY HH:mm[:ss].
+        let match = text.match(
+            /^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2,4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?$/
+        );
+        if (match) {
+            let year = parseInt(match[3], 10);
+            if (year < 100) year += 2000;
+            return new Date(
+                year,
+                parseInt(match[2], 10) - 1,
+                parseInt(match[1], 10),
+                parseInt(match[4], 10),
+                parseInt(match[5], 10),
+                parseInt(match[6] || '0', 10)
+            );
+        }
+
+        // Report-list format seen on the Spanish server: "jul 29, 02:49".
+        const monthMap = {
+            ene: 0,
+            jan: 0,
+            feb: 1,
+            mar: 2,
+            abr: 3,
+            apr: 3,
+            may: 4,
+            jun: 5,
+            jul: 6,
+            ago: 7,
+            aug: 7,
+            sep: 8,
+            sept: 8,
+            oct: 9,
+            nov: 10,
+            dic: 11,
+            dec: 11,
+        };
+
+        match = text
+            .toLowerCase()
+            .match(
+                /^([a-záéíóúñ]{3,4})\s+(\d{1,2}),?\s+(\d{1,2}):(\d{2})(?::(\d{2}))?$/
+            );
+
+        if (match) {
+            const monthKey = match[1]
+                .normalize('NFD')
+                .replace(/[\u0300-\u036f]/g, '')
+                .replace('.', '');
+            const month = monthMap[monthKey];
+
+            if (month !== undefined) {
+                let candidate = new Date(
+                    now.getFullYear(),
+                    month,
+                    parseInt(match[2], 10),
+                    parseInt(match[3], 10),
+                    parseInt(match[4], 10),
+                    parseInt(match[5] || '0', 10)
+                );
+
+                // Handle year rollover. Example: current date Jan 1 and report Dec 31.
+                if (candidate.getTime() - now.getTime() > 24 * 60 * 60 * 1000) {
+                    candidate = new Date(
+                        now.getFullYear() - 1,
+                        month,
+                        parseInt(match[2], 10),
+                        parseInt(match[3], 10),
+                        parseInt(match[4], 10),
+                        parseInt(match[5] || '0', 10)
+                    );
+                }
+
+                return candidate;
+            }
+        }
+
+        return null;
     }
 
     function renderResourcesCell(intel) {
