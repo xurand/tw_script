@@ -1,6 +1,6 @@
 /*
  * Script Name: Barbs Finder - ES Farm Intelligence (FORK)
- * Fork Version: v2.2.0-ES-FORK
+ * Fork Version: v2.3.0-ES-FORK
  * Fork Date: 2026-07-28
  * Original Project: Barbs Finder v2.0.2
  * Original Author: RedAlert
@@ -16,6 +16,9 @@
  * own attack reports to display the latest report date/time and scouted
  * resources for barbarian villages.
  * v2.2.0 adds non-overlapping distance ranges: 0-10, >10-20, ... >90-100.
+ * v2.3.0 improves report reading: scans every report-list page, parses the
+ * real #report_list rows, deduplicates report IDs, and distinguishes
+ * confirmed zero resources from unavailable scouting data.
  *
  * IMPORTANT: The original approval applies to the original script/version.
  * This fork must not be assumed to be approved; submit this exact version
@@ -36,7 +39,7 @@ var scriptConfig = {
     scriptData: {
         prefix: 'barbsFinder',
         name: 'Barbs Finder',
-        version: 'v2.2.0-ES-FORK',
+        version: 'v2.3.0-ES-FORK',
         author: 'RedAlert',
         authorUrl: 'https://twscripts.dev/',
         helpLink:
@@ -74,6 +77,9 @@ var scriptConfig = {
             'No scout data': 'No scout data',
             'Filter barbarian villages first!': 'Filter barbarian villages first!',
             'Reading reports...': 'Reading reports...',
+            'Reading report page': 'Reading report page',
+            'Opening latest reports': 'Opening latest reports',
+            'All report pages': 'All report pages',
             'Reports updated.': 'Reports updated.',
             'Could not read reports.': 'Could not read reports.',
             'Open report': 'Open report',
@@ -105,10 +111,13 @@ var scriptConfig = {
             Status: 'Estado',
             'No report': 'Sin informe',
             'Resources detected': 'Atacar: recursos detectados',
-            'No resources': 'No atacar: sin recursos',
+            'No resources': 'Sin recursos',
             'No scout data': 'Revisar: sin datos de espionaje',
             'Filter barbarian villages first!': '¡Primero filtra las aldeas bárbaras!',
             'Reading reports...': 'Leyendo informes...',
+            'Reading report page': 'Leyendo página de informes',
+            'Opening latest reports': 'Abriendo últimos informes',
+            'All report pages': 'Todas las páginas',
             'Reports updated.': 'Informes actualizados.',
             'Could not read reports.': 'No se pudieron leer los informes.',
             'Open report': 'Ver informe',
@@ -2225,14 +2234,9 @@ window.twSDK = {
                     <a href="javascript:void(0);" id="btnUpdateReports" class="btn">
                         ${twSDK.tt('Update Reports')}
                     </a>
-                    <label for="reportPages" class="ra-inline-label">${twSDK.tt(
-                        'Report pages:'
-                    )}</label>
-                    <select id="reportPages" class="ra-small-select">
-                        <option value="1">1</option>
-                        <option value="3" selected>3</option>
-                        <option value="5">5</option>
-                    </select>
+                    <span class="ra-inline-label">
+                        ${twSDK.tt('Report pages:')} ${twSDK.tt('All report pages')}
+                    </span>
                     <span id="reportsStatus" class="ra-report-status"></span>
                 </div>
                 <div class="ra-mb15">
@@ -2372,7 +2376,6 @@ window.twSDK = {
             const $button = jQuery(this);
             if ($button.attr('aria-disabled') === 'true') return;
 
-            const pagesToScan = parseInt(jQuery('#reportPages').val(), 10) || 1;
             const currentVillage = jQuery('#raCurrentVillage').val().trim();
 
             $button.addClass('disabled').attr('aria-disabled', 'true');
@@ -2380,8 +2383,7 @@ window.twSDK = {
 
             try {
                 reportIntelByCoord = await fetchLatestReportIntel(
-                    lastFilteredBarbs,
-                    pagesToScan
+                    lastFilteredBarbs
                 );
 
                 const tableContent = generateBarbariansTable(
@@ -2577,47 +2579,75 @@ window.twSDK = {
 
     // Read-only report intelligence. The player must explicitly click
     // "Actualizar informes". Only same-origin Tribal Wars pages are requested.
-    async function fetchLatestReportIntel(barbs, pagesToScan) {
+    async function fetchLatestReportIntel(barbs) {
         const targetCoords = new Set(
             barbs.map((barb) => `${barb[2]}|${barb[3]}`)
         );
         const latestByCoord = {};
-        let foundAnyReportPage = false;
+        const seenReportIds = new Set();
 
-        for (let page = 0; page < pagesToScan; page++) {
+        // Safety guard only. In normal use the loop stops as soon as the server
+        // returns an empty page or repeats the previous page.
+        const MAX_REPORT_PAGES = 200;
+
+        for (let page = 0; page < MAX_REPORT_PAGES; page++) {
             const reportUrl = buildReportOverviewUrl(page);
+
+            jQuery('#reportsStatus').text(
+                `${twSDK.tt('Reading report page')} ${page + 1}...`
+            );
+
             const html = await jQuery.ajax({
                 url: reportUrl,
                 method: 'GET',
                 dataType: 'html',
             });
 
-            const entries = parseAttackReportOverview(html, targetCoords);
-            if (entries.length > 0) foundAnyReportPage = true;
+            const pageData = parseAttackReportOverview(html, targetCoords);
 
-            // Report overviews are normally newest first. Keep only the first
-            // matching report for each barbarian coordinate.
-            entries.forEach((entry) => {
+            // No report rows means we reached the end.
+            if (pageData.reportIds.length === 0) {
+                break;
+            }
+
+            // If page=N is ignored by the server and the same report page is
+            // returned again, stop instead of looping indefinitely.
+            const newReportIds = pageData.reportIds.filter(
+                (reportId) => !seenReportIds.has(reportId)
+            );
+            if (page > 0 && newReportIds.length === 0) {
+                break;
+            }
+
+            pageData.reportIds.forEach((reportId) =>
+                seenReportIds.add(reportId)
+            );
+
+            // The report list is newest first. Therefore the first occurrence of
+            // a target coordinate is its latest report; older pages cannot replace it.
+            pageData.entries.forEach((entry) => {
                 if (!latestByCoord[entry.coord]) {
                     latestByCoord[entry.coord] = entry;
                 }
             });
 
-            // If a later page returns no report links at all, stop requesting pages.
-            if (page > 0 && !hasReportViewLinks(html)) break;
             await sleep(250);
         }
 
-        if (!foundAnyReportPage && Object.keys(latestByCoord).length === 0) {
-            return {};
-        }
+        const coordsToRead = Object.keys(latestByCoord);
+        let detailIndex = 0;
 
-        // Fetch one detail page per matched coordinate, sequentially and with a
-        // delay to avoid burst traffic. These GET requests only read the user's
-        // own report pages and never trigger game actions.
-        for (const coord of Object.keys(latestByCoord)) {
+        // Only open one detail report per matched barbarian: the latest one.
+        // This keeps the number of requests low even when the report history
+        // contains hundreds or thousands of rows.
+        for (const coord of coordsToRead) {
             const entry = latestByCoord[coord];
             if (!entry.url) continue;
+
+            detailIndex++;
+            jQuery('#reportsStatus').text(
+                `${twSDK.tt('Opening latest reports')} ${detailIndex}/${coordsToRead.length}...`
+            );
 
             try {
                 await sleep(250);
@@ -2626,12 +2656,31 @@ window.twSDK = {
                     method: 'GET',
                     dataType: 'html',
                 });
+
                 const resources = extractScoutedResources(reportHtml);
-                if (resources) {
+
+                if (resources !== null) {
                     entry.resources = resources;
                     entry.resourcesKnown = true;
+                } else if (entry.hasSpy && entry.lootExhausted) {
+                    // The report-list indicator "Saqueo parcial: ... saquearon
+                    // todo lo que encontraron" confirms that the village was
+                    // emptied by this attack. Even if the detail page omits a
+                    // 0/0/0 resource row, the useful farm state is known: 0.
+                    entry.resources = {
+                        wood: 0,
+                        stone: 0,
+                        iron: 0,
+                        total: 0,
+                    };
+                    entry.resourcesKnown = true;
                 } else {
-                    entry.resources = { wood: 0, stone: 0, iron: 0, total: 0 };
+                    entry.resources = {
+                        wood: 0,
+                        stone: 0,
+                        iron: 0,
+                        total: 0,
+                    };
                     entry.resourcesKnown = false;
                 }
             } catch (error) {
@@ -2647,49 +2696,112 @@ window.twSDK = {
     }
 
     function buildReportOverviewUrl(page) {
-        // link_base_pure normally ends in "screen="; appending report preserves
-        // the active village/session/sitter context supplied by the game.
-        let url = `${game_data.link_base_pure}report&mode=attack`;
-        if (page > 0) url += `&page=${page}`;
-        return url;
-    }
+        // Use the same report mode visible in the game's current report list.
+        // The user's "reports per page" preference remains active because these
+        // requests reuse the same browser session/cookies.
+        let url = `${game_data.link_base_pure}report&mode=all&group_id=-1`;
 
-    function hasReportViewLinks(html) {
-        const doc = parseHtmlDocument(html);
-        return jQuery(doc).find('a[href*="screen=report"][href*="view="]').length > 0;
+        // Page 0 is represented by the normal overview URL. Following pages use
+        // Tribal Wars' zero-based page parameter (page=1 is the second page).
+        if (page > 0) {
+            url += `&page=${page}`;
+        }
+
+        return url;
     }
 
     function parseAttackReportOverview(html, targetCoords) {
         const doc = parseHtmlDocument(html);
+        const $doc = jQuery(doc);
         const entries = [];
-        const seenUrls = new Set();
+        const reportIds = [];
 
-        jQuery(doc)
-            .find('a[href*="screen=report"][href*="view="]')
-            .each(function () {
-                const $link = jQuery(this);
-                const href = $link.attr('href');
-                if (!href || seenUrls.has(href)) return;
+        // The real report overview supplied by the game uses table#report_list
+        // and a.report-link. Parse rows directly instead of searching every link
+        // on the page, which was the cause of incomplete/fragile matches.
+        $doc.find('#report_list tr').each(function () {
+            const $row = jQuery(this);
+            const $link = $row.find('a.report-link[href*="view="]').first();
 
-                const $row = $link.closest('tr');
-                const searchableText = normalizeSpaces(
-                    ($row.length ? $row.text() : $link.text()) || ''
-                );
-                const coords = searchableText.match(/\d{1,3}\|\d{1,3}/g) || [];
-                const coord = coords.find((item) => targetCoords.has(item));
-                if (!coord) return;
+            if (!$link.length) return;
 
-                seenUrls.add(href);
-                entries.push({
-                    coord,
-                    url: absoluteGameUrl(href),
-                    dateText: extractDateTextFromReportRow($row),
-                    resourcesKnown: false,
-                    resources: { wood: 0, stone: 0, iron: 0, total: 0 },
-                });
+            const href = $link.attr('href');
+            const reportId =
+                String($link.attr('data-id') || '').trim() ||
+                getQueryParameterFromUrl(href, 'view');
+
+            if (!href || !reportId) return;
+            reportIds.push(reportId);
+
+            const $subject = $row.find('.quickedit-label').first();
+            const subjectText = normalizeSpaces(
+                $subject.length ? $subject.text() : $link.text()
+            );
+
+            // Subjects have the attacker's village first and target village last:
+            // "... (518|529) ... ataca a Pueblo bárbaro (520|531) ..."
+            // Therefore use the LAST coordinate, not the first matching one.
+            const coords = subjectText.match(/\d{1,3}\|\d{1,3}/g) || [];
+            const targetCoord = coords.length
+                ? coords[coords.length - 1]
+                : null;
+
+            if (!targetCoord || !targetCoords.has(targetCoord)) return;
+
+            const hasSpy =
+                $row.find(
+                    'img[src*="/command/spy"], img[data-title*="Espías"], img[data-title*="Espias"]'
+                ).length > 0;
+
+            const $lootIcon = $row
+                .find('img[src*="/max_loot/"], img[data-title^="Saqueo"]')
+                .first();
+            const lootSrc = String($lootIcon.attr('src') || '');
+            const lootTitle = String($lootIcon.attr('data-title') || '');
+
+            // max_loot/0 + "saquearon todo lo que encontraron" means the
+            // attackers did not fill their capacity because no more resources
+            // remained in the village after the attack.
+            const lootExhausted =
+                /\/max_loot\/0\.(?:webp|png|gif)/i.test(lootSrc) ||
+                /saquearon todo lo que encontraron/i.test(lootTitle);
+
+            const $dateCell = $row.find('td.nowrap').last();
+            const dateText = normalizeReportDateText(
+                normalizeSpaces($dateCell.text())
+            );
+
+            entries.push({
+                reportId,
+                coord: targetCoord,
+                url: absoluteGameUrl(href),
+                dateText,
+                hasSpy,
+                lootExhausted,
+                resourcesKnown: false,
+                resources: {
+                    wood: 0,
+                    stone: 0,
+                    iron: 0,
+                    total: 0,
+                },
             });
+        });
 
-        return entries;
+        return {
+            entries,
+            reportIds: [...new Set(reportIds)],
+        };
+    }
+
+    function getQueryParameterFromUrl(url, parameter) {
+        try {
+            return new URL(url, window.location.origin).searchParams.get(
+                parameter
+            );
+        } catch (error) {
+            return null;
+        }
     }
 
     function extractDateTextFromReportRow($row) {
@@ -2762,36 +2874,68 @@ window.twSDK = {
         const $doc = jQuery(doc);
         let bestCandidate = null;
 
-        $doc.find('tr').each(function () {
-            const $row = jQuery(this);
-            const label = normalizeSpaces(
-                $row.find('th, td').first().text() || $row.text()
-            ).toLowerCase();
+        // Inspect report rows and compact blocks. Do not inspect the entire page as
+        // one container because loot tooltips also contain wood/stone/iron icons.
+        $doc.find('tr, .report_ReportAttack, .report-result, .vis_item').each(
+            function () {
+                const $container = jQuery(this);
+                const text = normalizeSpaces($container.text());
+                const lowerText = text.toLowerCase();
 
-            // Loot/plunder is what the attack carried home, not the resources
-            // remaining in the village after successful scouting.
-            if (/bot[ií]n|saque|loot|plunder|recursos saqueados/.test(label)) {
-                return;
+                // Loot/plunder is what the army carried away, not the resources
+                // remaining/revealed by scouting.
+                if (
+                    /bot[ií]n|saqueo|saquead|loot|plunder|recursos saqueados/.test(
+                        lowerText
+                    )
+                ) {
+                    return;
+                }
+
+                const resources = extractResourcesFromContainer($container);
+                let score = 1;
+
+                if (
+                    /recursos|resources|espi|explor|scout|restant|dispon/.test(
+                        lowerText
+                    )
+                ) {
+                    score = 10;
+                }
+
+                if (resources !== null) {
+                    if (!bestCandidate || score > bestCandidate.score) {
+                        bestCandidate = {
+                            score,
+                            resources,
+                        };
+                    }
+                    return;
+                }
+
+                // Some report layouts omit the three resource icons when every
+                // scouted value is zero and render only an explicit "Recursos: 0"
+                // or "0 0 0". Treat that as known zero, not missing scout data.
+                if (
+                    /recursos|resources/.test(lowerText) &&
+                    isExplicitZeroResourceText(text)
+                ) {
+                    const zeroResources = {
+                        wood: 0,
+                        stone: 0,
+                        iron: 0,
+                        total: 0,
+                    };
+
+                    if (!bestCandidate || score > bestCandidate.score) {
+                        bestCandidate = {
+                            score,
+                            resources: zeroResources,
+                        };
+                    }
+                }
             }
-
-            const resources = extractResourcesFromContainer($row);
-            if (!resources) return;
-
-            let score = 1;
-            if (/espi|explor|scout|recursos.*(?:aldea|pueblo|encontr|restant|dispon)/.test(label)) {
-                score = 10;
-            }
-
-            if (!bestCandidate || score > bestCandidate.score) {
-                bestCandidate = { score, resources };
-            }
-        });
-
-        // Fallback for layouts where the resource line is not wrapped in a table row.
-        if (!bestCandidate) {
-            const resources = extractResourcesFromContainer($doc);
-            if (resources) bestCandidate = { score: 1, resources };
-        }
+        );
 
         return bestCandidate ? bestCandidate.resources : null;
     }
@@ -2817,8 +2961,10 @@ window.twSDK = {
             }
 
             if (!$icon.length) return null;
+
             const amount = readNumberFollowingElement($icon[0]);
             if (amount === null) return null;
+
             result[resource] = amount;
         }
 
@@ -2827,32 +2973,63 @@ window.twSDK = {
     }
 
     function readNumberFollowingElement(element) {
+        // Tribal Wars commonly wraps each resource icon and amount in
+        // <span class="nowrap">...</span>. Reading that wrapper independently
+        // prevents the wood amount from being reused for clay/iron.
+        const $nowrap = jQuery(element).closest('.nowrap');
+        if ($nowrap.length) {
+            const wrappedAmount = parseGameNumber($nowrap.text());
+            if (wrappedAmount !== null) return wrappedAmount;
+        }
+
         let node = element.nextSibling;
         let collected = '';
 
         while (node) {
             if (node.nodeType === 1 && isResourceIcon(node)) break;
+
             collected += ` ${node.textContent || ''}`;
             const number = parseGameNumber(collected);
             if (number !== null) return number;
+
             node = node.nextSibling;
         }
 
-        // Some layouts wrap the icon and amount in a small container.
-        const parentText = element.parentNode ? element.parentNode.textContent : '';
+        // Last fallback: use the immediate parent only.
+        const parentText = element.parentNode
+            ? element.parentNode.textContent
+            : '';
         return parseGameNumber(parentText);
     }
 
     function isResourceIcon(node) {
         if (!node || node.nodeType !== 1) return false;
-        const descriptor = `${node.className || ''} ${node.getAttribute('src') || ''}`.toLowerCase();
+
+        const descriptor = `${node.className || ''} ${
+            node.getAttribute('src') || ''
+        }`.toLowerCase();
+
         return /(?:wood|holz|stone|clay|lehm|iron|eisen)/.test(descriptor);
     }
 
+    function isExplicitZeroResourceText(value) {
+        const text = normalizeSpaces(value)
+            .replace(/recursos|resources|madera|barro|arcilla|hierro|wood|stone|clay|iron/gi, ' ')
+            .trim();
+
+        // Require at least one explicit zero and reject any positive digit.
+        return /(?:^|\D)0(?:\D|$)/.test(text) && !/[1-9]/.test(text);
+    }
+
     function parseGameNumber(value) {
-        if (!value) return null;
-        const match = String(value).match(/\d[\d.\s,]*/);
+        if (value === null || value === undefined) return null;
+
+        const text = String(value).trim();
+        if (!text) return null;
+
+        const match = text.match(/\d[\d.\s,]*/);
         if (!match) return null;
+
         const digits = match[0].replace(/[^\d]/g, '');
         return digits.length ? parseInt(digits, 10) : null;
     }
