@@ -1,6 +1,6 @@
 /*
  * Script Name: Barbs Finder - ES Farm Intelligence (FORK)
- * Fork Version: v2.5.0-ES-FORK
+ * Fork Version: v2.5.1-ES-FORK
  * Fork Date: 2026-07-28
  * Original Project: Barbs Finder v2.0.2
  * Original Author: RedAlert
@@ -25,6 +25,9 @@
  * v2.4.1 shows the latest attack as relative elapsed time (e.g. "hace 12 min").
  * v2.5.0 fixes report pagination by following Tribal Wars real "from=" offsets
  * (e.g. from=100, from=200) and discovering pagination links dynamically.
+ * v2.5.1 adds an in-memory report cache shared across distance ranges.
+ * Changing ranges reuses cached intel; Update Reports refreshes the
+ * current range. Reset clears the cache. Filter-warning text was removed.
  *
  * IMPORTANT: The original approval applies to the original script/version.
  * This fork must not be assumed to be approved; submit this exact version
@@ -45,7 +48,7 @@ var scriptConfig = {
     scriptData: {
         prefix: 'barbsFinder',
         name: 'Barbs Finder',
-        version: 'v2.5.0-ES-FORK',
+        version: 'v2.5.1-ES-FORK',
         author: 'RedAlert',
         authorUrl: 'https://twscripts.dev/',
         helpLink:
@@ -2176,6 +2179,10 @@ window.twSDK = {
     let lastFilteredBarbs = [];
     let reportIntelByCoord = {};
 
+    // In-memory cache shared by every distance range while this script is open.
+    // Key: target village coordinate. Value: latest report intelligence.
+    let reportIntelCache = {};
+
     // Official standard carrying capacity of one light cavalry.
     // Scout carrying capacity is 0, so the fixed scout does not affect the calculation.
     const LIGHT_CARRY_CAPACITY = 80;
@@ -2347,14 +2354,18 @@ window.twSDK = {
                 );
                 let barbariansCount = barbariansCoordsArray.length;
                 let barbariansCoordsList = barbariansCoordsArray.join(' ');
+
+                // Change the visible range without losing report information
+                // previously loaded for other ranges.
+                lastFilteredBarbs = filteredByRadiusBarbs;
+                reportIntelByCoord = getCachedIntelForBarbs(
+                    filteredByRadiusBarbs
+                );
+
                 const scoutScript = generateSequentialScoutScript(
                     filteredByRadiusBarbs,
                     reportIntelByCoord
                 );
-                // Keep the current result set so report analysis is always explicitly
-                // tied to the villages the player has just filtered.
-                lastFilteredBarbs = filteredByRadiusBarbs;
-                reportIntelByCoord = {};
 
                 let tableContent = generateBarbariansTable(
                     filteredByRadiusBarbs,
@@ -2362,8 +2373,14 @@ window.twSDK = {
                     reportIntelByCoord
                 );
 
+                const cachedCount = Object.keys(reportIntelByCoord).length;
+
                 jQuery('#barbsCount').text(barbariansCount);
-                jQuery('#reportsStatus').text('');
+                jQuery('#reportsStatus').text(
+                    cachedCount > 0
+                        ? `${cachedCount} informe(s) recuperado(s) del caché.`
+                        : ''
+                );
                 jQuery('#barbCoordsList').text(barbariansCoordsList);
                 jQuery('#barbScoutScript').val(scoutScript);
                 jQuery('#barbariansTable').show();
@@ -2397,7 +2414,21 @@ window.twSDK = {
             jQuery('#reportsStatus').text(twSDK.tt('Reading reports...'));
 
             try {
-                reportIntelByCoord = await fetchLatestReportIntel(
+                const freshIntel = await fetchLatestReportIntel(
+                    lastFilteredBarbs
+                );
+
+                // "Actualizar informes" always refreshes the current range.
+                // Remove stale cache entries for this range, then save the
+                // freshly discovered reports.
+                lastFilteredBarbs.forEach((barb) => {
+                    const coord = `${barb[2]}|${barb[3]}`;
+                    delete reportIntelCache[coord];
+                });
+
+                Object.assign(reportIntelCache, freshIntel);
+
+                reportIntelByCoord = getCachedIntelForBarbs(
                     lastFilteredBarbs
                 );
 
@@ -2442,9 +2473,24 @@ window.twSDK = {
             jQuery('#reportsStatus').text('');
             lastFilteredBarbs = [];
             reportIntelByCoord = {};
+            reportIntelCache = {};
             jQuery('#barbariansTable').hide();
             jQuery('#barbariansTable').html('');
         });
+    }
+
+    // Return only cached report information belonging to the supplied villages.
+    function getCachedIntelForBarbs(barbs) {
+        const intel = {};
+
+        barbs.forEach((barb) => {
+            const coord = `${barb[2]}|${barb[3]}`;
+            if (reportIntelCache[coord]) {
+                intel[coord] = reportIntelCache[coord];
+            }
+        });
+
+        return intel;
     }
 
     // Generate Table
@@ -2784,7 +2830,6 @@ window.twSDK = {
         const MAX_REPORT_PAGES = 200;
         let detectedPageSize = 0;
         let pagesScanned = 0;
-        let activeFilterSummary = '';
 
         while (
             pendingOffsets.length > 0 &&
@@ -2813,10 +2858,6 @@ window.twSDK = {
             });
 
             pagesScanned++;
-
-            if (!activeFilterSummary) {
-                activeFilterSummary = detectActiveReportFilters(html);
-            }
 
             const pageData = parseAttackReportOverview(html, targetCoords);
 
@@ -2966,12 +3007,6 @@ window.twSDK = {
             `${pagesScanned} pág.`,
         ];
 
-        if (activeFilterSummary) {
-            finalStatusParts.push(
-                `${twSDK.tt('Active report filters')}: ${activeFilterSummary}`
-            );
-        }
-
         jQuery('#reportsStatus').text(finalStatusParts.join(' · '));
 
         return latestByCoord;
@@ -2980,8 +3015,8 @@ window.twSDK = {
     function buildReportOverviewUrl(offset = 0) {
         // The actual Tribal Wars report pagination uses "from=", not "page=".
         // Use mode=all so the parser sees the same report list structure as the
-        // normal overview. Existing in-game report filters may still apply,
-        // therefore they are detected and shown to the user in the status text.
+        // normal overview. Existing in-game report filters may still apply
+        // at server/session level, but this fork does not display filter-warning text.
         let url = `${game_data.link_base_pure}report&mode=all`;
 
         if (offset > 0) {
@@ -3022,47 +3057,6 @@ window.twSDK = {
         }
 
         return 0;
-    }
-
-    function detectActiveReportFilters(html) {
-        const doc = parseHtmlDocument(html);
-        const $doc = jQuery(doc);
-        const filters = [];
-
-        const subject = normalizeSpaces(
-            $doc.find('#filter_subject').val() || ''
-        );
-        if (subject) {
-            filters.push(`título="${subject}"`);
-        }
-
-        if ($doc.find('#filter_current_village:checked').length) {
-            filters.push('pueblo actual');
-        }
-
-        if ($doc.find('#filter_max_loot:checked').length) {
-            filters.push('botín máximo');
-        }
-
-        if ($doc.find('#filter_own_reports:checked').length) {
-            filters.push('solo propios');
-        }
-
-        const checkedBattleFilters = $doc.find(
-            '#battle_filter_form input.report-filter-checkbox:checked'
-        ).length;
-        if (checkedBattleFilters > 0) {
-            filters.push('resultado de batalla');
-        }
-
-        const checkedIconFilters = $doc.find(
-            'input[name^="filter_attack_type"]:checked, input[name^="filter_icon["]:checked'
-        ).length;
-        if (checkedIconFilters > 0) {
-            filters.push('iconos');
-        }
-
-        return filters.join(', ');
     }
 
     function parseAttackReportOverview(html, targetCoords) {
