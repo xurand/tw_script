@@ -1,6 +1,6 @@
 /*
  * Script Name: Barbs Finder - ES Farm Intelligence (FORK)
- * Fork Version: v2.5.1-ES-FORK
+ * Fork Version: v2.5.2-ES-FORK
  * Fork Date: 2026-07-28
  * Original Project: Barbs Finder v2.0.2
  * Original Author: RedAlert
@@ -28,6 +28,8 @@
  * v2.5.1 adds an in-memory report cache shared across distance ranges.
  * Changing ranges reuses cached intel; Update Reports refreshes the
  * current range. Reset clears the cache. Filter-warning text was removed.
+ * v2.5.2 prevents endless pagination when only one report page exists or
+ * when the server ignores an invalid from= offset and repeats the same page.
  *
  * IMPORTANT: The original approval applies to the original script/version.
  * This fork must not be assumed to be approved; submit this exact version
@@ -48,7 +50,7 @@ var scriptConfig = {
     scriptData: {
         prefix: 'barbsFinder',
         name: 'Barbs Finder',
-        version: 'v2.5.1-ES-FORK',
+        version: 'v2.5.2-ES-FORK',
         author: 'RedAlert',
         authorUrl: 'https://twscripts.dev/',
         helpLink:
@@ -2827,7 +2829,7 @@ window.twSDK = {
         const pendingOffsets = [0];
 
         // Safety guard only. Normal execution stops at the last discovered page.
-        const MAX_REPORT_PAGES = 200;
+        const MAX_REPORT_PAGES = 100;
         let detectedPageSize = 0;
         let pagesScanned = 0;
 
@@ -2866,20 +2868,51 @@ window.twSDK = {
                 continue;
             }
 
-            // Detect the actual report-page size from the real pagination links.
-            // On the user's server with 100 reports/page this resolves to 100.
-            if (!detectedPageSize) {
+            // Discover the real pagination links exposed by Tribal Wars.
+            // A single-page report list has no positive "from=" offsets.
+            const discoveredOffsets = extractReportPageOffsets(html);
+            const positiveDiscoveredOffsets = discoveredOffsets.filter(
+                (value) => value > 0
+            );
+            const hasRealPagination = positiveDiscoveredOffsets.length > 0;
+
+            // Detect the actual page size only from real pagination links.
+            // Do not use the row count as evidence of another page: a single
+            // page can contain exactly 20/50/100 reports and still be the end.
+            if (!detectedPageSize && hasRealPagination) {
                 detectedPageSize = detectReportPageSize(html);
-                if (!detectedPageSize) {
-                    detectedPageSize = pageData.reportIds.length;
-                }
             }
 
-            // Discover every real page URL exposed by Tribal Wars.
-            // The server uses "from=100", "from=200", ... rather than page=1/2.
-            const discoveredOffsets = extractReportPageOffsets(html);
+            // Determine whether this response contains any reports that were
+            // not already returned by a previous offset.
+            const newReportIds = pageData.reportIds.filter(
+                (reportId) => !seenReportIds.has(reportId)
+            );
+
+            // If a non-zero offset returns no new IDs, the server ignored the
+            // offset or repeated the last page. Stop this pagination branch
+            // immediately and never infer another offset from this response.
+            if (offset > 0 && newReportIds.length === 0) {
+                pendingOffsets.length = 0;
+                break;
+            }
+
+            pageData.reportIds.forEach((reportId) =>
+                seenReportIds.add(reportId)
+            );
+
+            // Report pages are newest first. The first occurrence of a target
+            // coordinate is its latest report; older pages cannot replace it.
+            pageData.entries.forEach((entry) => {
+                if (!latestByCoord[entry.coord]) {
+                    latestByCoord[entry.coord] = entry;
+                }
+            });
+
+            // Queue only pagination offsets that the game explicitly exposes.
             discoveredOffsets.forEach((nextOffset) => {
                 if (
+                    nextOffset > 0 &&
                     !visitedOffsets.has(nextOffset) &&
                     !pendingOffsets.includes(nextOffset)
                 ) {
@@ -2887,14 +2920,17 @@ window.twSDK = {
                 }
             });
 
-            // Extra fallback: if this is a full page, infer the next offset.
-            // This also works if the pagination control only exposes a subset
-            // of pages in very large report histories.
+            // Conservative fallback for pagers that expose only a sliding
+            // window: infer the next offset only after real pagination has
+            // been confirmed and only while this page contains new reports.
             if (
                 detectedPageSize > 0 &&
+                hasRealPagination &&
+                newReportIds.length > 0 &&
                 pageData.reportIds.length >= detectedPageSize
             ) {
                 const inferredNextOffset = offset + detectedPageSize;
+
                 if (
                     !visitedOffsets.has(inferredNextOffset) &&
                     !pendingOffsets.includes(inferredNextOffset)
@@ -2903,29 +2939,14 @@ window.twSDK = {
                 }
             }
 
-            // If the server ignored an offset and returned a page containing
-            // only already-seen report IDs, do not infer another page from it.
-            const newReportIds = pageData.reportIds.filter(
-                (reportId) => !seenReportIds.has(reportId)
-            );
-
-            pageData.reportIds.forEach((reportId) =>
-                seenReportIds.add(reportId)
-            );
-
-            // Report pages are newest first. The first occurrence of a target
-            // coordinate is its latest report; older pages cannot replace it.
-            if (newReportIds.length > 0 || offset === 0) {
-                pageData.entries.forEach((entry) => {
-                    if (!latestByCoord[entry.coord]) {
-                        latestByCoord[entry.coord] = entry;
-                    }
-                });
+            // No pagination links on the first response means there is only
+            // one page, even when that page is exactly full.
+            if (offset === 0 && !hasRealPagination) {
+                pendingOffsets.length = 0;
             }
 
-            // If this page is shorter than the configured page size it is the
-            // last page; remove any inferred offsets beyond it, while keeping
-            // real offsets that were explicitly found in the HTML.
+            // A shorter page is the last page. Remove inferred offsets beyond
+            // it, retaining only offsets explicitly present in the HTML.
             if (
                 detectedPageSize > 0 &&
                 pageData.reportIds.length < detectedPageSize
