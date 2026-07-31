@@ -1,6 +1,6 @@
 /*
  * Script Name: Barbs Finder - ES Farm Intelligence (FORK)
- * Fork Version: v2.6.1-ES-FORK
+ * Fork Version: v2.6.2-ES-FORK
  * Fork Date: 2026-07-31
  * Original Project: Barbs Finder v2.0.2
  * Original Author: RedAlert
@@ -38,6 +38,9 @@
  * production factor (52/30 = 1.733333...) are both applied. It also reads
  * resources directly from #attack_spy_resources to avoid confusing loot
  * with the resources revealed by espionage.
+ * v2.6.2 removes an incorrect resource-bonus calculation. The seventh
+ * village.txt field is village rank, not a bonus identifier; treating a
+ * rank of 3 as an iron bonus incorrectly doubled iron production.
  *
  * IMPORTANT: The original approval applies to the original script/version.
  * This fork must not be assumed to be approved; submit this exact version
@@ -58,7 +61,7 @@ var scriptConfig = {
     scriptData: {
         prefix: 'barbsFinder',
         name: 'Barbs Finder',
-        version: 'v2.6.1-ES-FORK',
+        version: 'v2.6.2-ES-FORK',
         author: 'RedAlert',
         authorUrl: 'https://twscripts.dev/',
         helpLink:
@@ -2677,8 +2680,7 @@ window.twSDK = {
 
         const reportDate = parseReportDate(intel.dateText);
         const production = calculateHourlyProduction(
-            intel.buildings,
-            intel.villageType
+            intel.buildings
         );
 
         // If the building levels or report time are unavailable, retain the
@@ -2723,7 +2725,7 @@ window.twSDK = {
         return estimated;
     }
 
-    function calculateHourlyProduction(buildings, villageType = 0) {
+    function calculateHourlyProduction(buildings) {
         if (!buildings) return null;
 
         const woodLevel = normalizeBuildingLevel(buildings.wood);
@@ -2738,26 +2740,15 @@ window.twSDK = {
             return null;
         }
 
+        // village.txt does not expose the bonus-village resource type.
+        // Its seventh field is the village rank, so it must never be used
+        // as a wood/clay/iron bonus identifier.
         const production = {
             wood: calculateResourceBuildingProduction(woodLevel),
             stone: calculateResourceBuildingProduction(stoneLevel),
             iron: calculateResourceBuildingProduction(ironLevel),
         };
 
-        // Tribal Wars village.txt bonus IDs used by resource bonus villages.
-        const bonusType = Number(villageType) || 0;
-        if (bonusType === 1) production.wood *= 2;
-        if (bonusType === 2) production.stone *= 2;
-        if (bonusType === 3) production.iron *= 2;
-        if (bonusType === 8) {
-            production.wood *= 1.3;
-            production.stone *= 1.3;
-            production.iron *= 1.3;
-        }
-
-        production.wood = Math.round(production.wood);
-        production.stone = Math.round(production.stone);
-        production.iron = Math.round(production.iron);
         production.total =
             production.wood + production.stone + production.iron;
 
@@ -2846,7 +2837,13 @@ window.twSDK = {
         if (minutes < 60) return `hace ${minutes} min`;
 
         const hours = Math.floor(minutes / 60);
-        if (hours < 24) return `hace ${hours} h`;
+        if (hours < 24) {
+            const remainingMinutes = minutes % 60;
+            if (remainingMinutes === 0) {
+                return `hace ${hours} h`;
+            }
+            return `hace ${hours} h ${remainingMinutes} min`;
+        }
 
         const days = Math.floor(hours / 24);
         if (days < 30) {
@@ -2998,6 +2995,9 @@ window.twSDK = {
                     6
                 )}`
             );
+            tooltipParts.push(
+                'Bonificación específica del pueblo: no aplicada'
+            );
         } else {
             tooltipParts.push('Sin niveles productivos: se usa el último dato conocido');
         }
@@ -3061,7 +3061,6 @@ window.twSDK = {
                 `${barb[2]}|${barb[3]}`,
                 {
                     villageId: Number(barb[0]) || 0,
-                    villageType: Number(barb[6]) || 0,
                 },
             ])
         );
@@ -3151,7 +3150,6 @@ window.twSDK = {
                     latestByCoord[entry.coord] = {
                         ...entry,
                         villageId: targetMeta.villageId || 0,
-                        villageType: targetMeta.villageType || 0,
                     };
                 }
             });
