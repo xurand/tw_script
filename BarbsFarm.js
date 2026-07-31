@@ -1,6 +1,6 @@
 /*
  * Script Name: Barbs Finder - ES Farm Intelligence (FORK)
- * Fork Version: v2.6.2-ES-FORK
+ * Fork Version: v2.6.3-ES-FORK
  * Fork Date: 2026-07-31
  * Original Project: Barbs Finder v2.0.2
  * Original Author: RedAlert
@@ -41,6 +41,9 @@
  * v2.6.2 removes an incorrect resource-bonus calculation. The seventh
  * village.txt field is village rank, not a bonus identifier; treating a
  * rank of 3 as an iron bonus incorrectly doubled iron production.
+ * v2.6.3 uses the effective Classic 3 abandoned-village production observed
+ * in consecutive reports (2x the standard resPerHour table), reads the real
+ * report bonus icons, and estimates resources at light-cavalry arrival time.
  *
  * IMPORTANT: The original approval applies to the original script/version.
  * This fork must not be assumed to be approved; submit this exact version
@@ -61,7 +64,7 @@ var scriptConfig = {
     scriptData: {
         prefix: 'barbsFinder',
         name: 'Barbs Finder',
-        version: 'v2.6.2-ES-FORK',
+        version: 'v2.6.3-ES-FORK',
         author: 'RedAlert',
         authorUrl: 'https://twscripts.dev/',
         helpLink:
@@ -2206,21 +2209,26 @@ window.twSDK = {
     const LIGHT_CARRY_CAPACITY = 80;
     const DEFAULT_LIGHTS_WITHOUT_REPORT = 10;
 
-    // Classic 3 public settings. Runtime configuration is preferred.
-    // Resource factor 1.733333... is NOT the complete multiplier:
-    // total multiplier = game speed 4 * resource factor 1.733333... = 6.933333...
+    // Classic 3 public movement settings. Runtime configuration is preferred.
     const CLASSIC_3_GAME_SPEED = 4;
-    const CLASSIC_3_BASE_PRODUCTION = 52;
-    const STANDARD_BASE_PRODUCTION = 30;
+    const CLASSIC_3_UNIT_SPEED = 0.6;
+    const STANDARD_LIGHT_MINUTES_PER_FIELD = 10;
 
     const WORLD_GAME_SPEED =
         worldRuntimeConfig.gameSpeed || CLASSIC_3_GAME_SPEED;
-    const WORLD_BASE_PRODUCTION =
-        worldRuntimeConfig.baseProduction || CLASSIC_3_BASE_PRODUCTION;
-    const WORLD_RESOURCE_PRODUCTION_FACTOR =
-        WORLD_BASE_PRODUCTION / STANDARD_BASE_PRODUCTION;
-    const WORLD_TOTAL_PRODUCTION_MULTIPLIER =
-        WORLD_GAME_SPEED * WORLD_RESOURCE_PRODUCTION_FACTOR;
+    const WORLD_UNIT_SPEED =
+        worldRuntimeConfig.unitSpeed || CLASSIC_3_UNIT_SPEED;
+
+    // Empirically verified on Classic 3 with consecutive reports:
+    // level 6 wood => 64 base * 2 = 128/h
+    // level 5 clay => 55 base * 2 = 110/h
+    // level 5 iron + bonus_icon_3 => 55 * 2 * 2 = 220/h
+    //
+    // The public 1.733333... factor describes normal world resource production,
+    // but it did not match the effective regeneration of abandoned/bonus villages
+    // measured in the user's reports. Farming estimates therefore use this
+    // dedicated abandoned-village multiplier.
+    const CLASSIC_3_ABANDONED_PRODUCTION_MULTIPLIER = 2;
 
     // Entry point
     try {
@@ -2232,13 +2240,11 @@ window.twSDK = {
         handleResetFilters();
         handleUpdateReports();
 
-        console.info(`${scriptInfo} Production configuration`, {
+        console.info(`${scriptInfo} Farming production configuration`, {
             gameSpeed: WORLD_GAME_SPEED,
-            baseProduction: WORLD_BASE_PRODUCTION,
-            resourceProductionFactor:
-                WORLD_RESOURCE_PRODUCTION_FACTOR,
-            totalProductionMultiplier:
-                WORLD_TOTAL_PRODUCTION_MULTIPLIER,
+            unitSpeed: WORLD_UNIT_SPEED,
+            abandonedVillageMultiplier:
+                CLASSIC_3_ABANDONED_PRODUCTION_MULTIPLIER,
             source: worldRuntimeConfig.source,
         });
     } catch (error) {
@@ -2609,9 +2615,13 @@ window.twSDK = {
             const intel = intelByCoord[coord];
             const reportCell = renderLatestReportCell(intel);
             const wallCell = renderWallLevelCell(intel);
-            const resourcesCell = renderResourcesCell(intel);
-            const lightNeeded = calculateLightCavalryNeeded(intel);
-            const statusCell = renderStatusCell(intel);
+            const distance = Number(barb[7]) || 0;
+            const resourcesCell = renderResourcesCell(intel, distance);
+            const lightNeeded = calculateLightCavalryNeeded(
+                intel,
+                distance
+            );
+            const statusCell = renderStatusCell(intel, distance);
 
             renderTableRows += `
                     <tr>
@@ -2645,16 +2655,14 @@ window.twSDK = {
     }
 
 
-    function calculateLightCavalryNeeded(intel) {
+    function calculateLightCavalryNeeded(intel, distance = 0) {
         // Explicit user requirement: no report => 10 light cavalry.
         if (!intel) {
             return DEFAULT_LIGHTS_WITHOUT_REPORT;
         }
 
-        const estimated = calculateEstimatedResources(intel);
+        const estimated = calculateEstimatedResources(intel, distance);
 
-        // A report exists but its resource/building data could not be read.
-        // Keep a practical fallback instead of generating an empty attack.
         if (!estimated || !Number.isFinite(Number(estimated.total))) {
             return DEFAULT_LIGHTS_WITHOUT_REPORT;
         }
@@ -2668,7 +2676,7 @@ window.twSDK = {
         return Math.ceil(totalResources / LIGHT_CARRY_CAPACITY);
     }
 
-    function calculateEstimatedResources(intel) {
+    function calculateEstimatedResources(intel, distance = 0) {
         if (
             !intel ||
             !intel.resourcesKnown ||
@@ -2680,17 +2688,18 @@ window.twSDK = {
 
         const reportDate = parseReportDate(intel.dateText);
         const production = calculateHourlyProduction(
-            intel.buildings
+            intel.buildings,
+            intel.resourceBonuses
         );
 
-        // If the building levels or report time are unavailable, retain the
-        // exact last-known resources rather than inventing production.
         if (!reportDate || !production) {
             return {
                 wood: Math.max(0, Number(intel.resources.wood) || 0),
                 stone: Math.max(0, Number(intel.resources.stone) || 0),
                 iron: Math.max(0, Number(intel.resources.iron) || 0),
                 total: Math.max(0, Number(intel.resources.total) || 0),
+                reportAgeHours: 0,
+                travelHours: 0,
                 elapsedHours: 0,
                 productionKnown: false,
                 hourlyProduction: null,
@@ -2698,10 +2707,12 @@ window.twSDK = {
         }
 
         const now = twSDK.getServerDateTimeObject();
-        const elapsedHours = Math.max(
+        const reportAgeHours = Math.max(
             0,
             (now.getTime() - reportDate.getTime()) / (1000 * 60 * 60)
         );
+        const travelHours = calculateLightTravelHours(distance);
+        const elapsedHours = reportAgeHours + travelHours;
 
         const estimated = {
             wood: Math.floor(
@@ -2716,6 +2727,8 @@ window.twSDK = {
                 Math.max(0, Number(intel.resources.iron) || 0) +
                     production.iron * elapsedHours
             ),
+            reportAgeHours,
+            travelHours,
             elapsedHours,
             productionKnown: true,
             hourlyProduction: production,
@@ -2725,7 +2738,28 @@ window.twSDK = {
         return estimated;
     }
 
-    function calculateHourlyProduction(buildings) {
+    function calculateLightTravelHours(distance) {
+        const safeDistance = Math.max(0, Number(distance) || 0);
+
+        if (
+            safeDistance === 0 ||
+            !Number.isFinite(WORLD_GAME_SPEED) ||
+            !Number.isFinite(WORLD_UNIT_SPEED) ||
+            WORLD_GAME_SPEED <= 0 ||
+            WORLD_UNIT_SPEED <= 0
+        ) {
+            return 0;
+        }
+
+        const minutes =
+            (safeDistance * STANDARD_LIGHT_MINUTES_PER_FIELD) /
+            WORLD_GAME_SPEED /
+            WORLD_UNIT_SPEED;
+
+        return minutes / 60;
+    }
+
+    function calculateHourlyProduction(buildings, resourceBonuses = null) {
         if (!buildings) return null;
 
         const woodLevel = normalizeBuildingLevel(buildings.wood);
@@ -2740,13 +2774,22 @@ window.twSDK = {
             return null;
         }
 
-        // village.txt does not expose the bonus-village resource type.
-        // Its seventh field is the village rank, so it must never be used
-        // as a wood/clay/iron bonus identifier.
+        const bonuses = normalizeResourceBonuses(resourceBonuses);
+
         const production = {
-            wood: calculateResourceBuildingProduction(woodLevel),
-            stone: calculateResourceBuildingProduction(stoneLevel),
-            iron: calculateResourceBuildingProduction(ironLevel),
+            wood: Math.round(
+                calculateAbandonedResourceProduction(woodLevel) *
+                    bonuses.wood
+            ),
+            stone: Math.round(
+                calculateAbandonedResourceProduction(stoneLevel) *
+                    bonuses.stone
+            ),
+            iron: Math.round(
+                calculateAbandonedResourceProduction(ironLevel) *
+                    bonuses.iron
+            ),
+            bonuses,
         };
 
         production.total =
@@ -2755,27 +2798,40 @@ window.twSDK = {
         return production;
     }
 
-    function calculateResourceBuildingProduction(level) {
+    function calculateAbandonedResourceProduction(level) {
         const normalizedLevel = Math.max(
             0,
             Math.min(30, Number(level) || 0)
         );
 
-        // Resource building level 0 uses the legacy base table value.
-        if (normalizedLevel === 0) {
-            return Math.round(
-                (Number(twSDK.resPerHour[0]) || 0) *
-                    WORLD_TOTAL_PRODUCTION_MULTIPLIER
-            );
-        }
+        const baseProduction =
+            Number(twSDK.resPerHour[normalizedLevel]) || 0;
 
-        // Official Tribal Wars production curve:
-        // round(1.163118^(level - 1) * world speed * base production).
-        return Math.round(
-            Math.pow(1.163118, normalizedLevel - 1) *
-                WORLD_GAME_SPEED *
-                WORLD_BASE_PRODUCTION
+        return (
+            baseProduction *
+            CLASSIC_3_ABANDONED_PRODUCTION_MULTIPLIER
         );
+    }
+
+    function normalizeResourceBonuses(value) {
+        return {
+            wood:
+                value && Number.isFinite(Number(value.wood))
+                    ? Math.max(0, Number(value.wood))
+                    : 1,
+            stone:
+                value && Number.isFinite(Number(value.stone))
+                    ? Math.max(0, Number(value.stone))
+                    : 1,
+            iron:
+                value && Number.isFinite(Number(value.iron))
+                    ? Math.max(0, Number(value.iron))
+                    : 1,
+            labels:
+                value && Array.isArray(value.labels)
+                    ? value.labels
+                    : [],
+        };
     }
 
     function normalizeBuildingLevel(value) {
@@ -2789,7 +2845,8 @@ window.twSDK = {
         const targets = barbs.map((barb) => {
             const coord = `${barb[2]}|${barb[3]}`;
             const lightNeeded = calculateLightCavalryNeeded(
-                intelByCoord[coord]
+                intelByCoord[coord],
+                Number(barb[7]) || 0
             );
             return `${coord}:${lightNeeded}`;
         });
@@ -2959,8 +3016,8 @@ window.twSDK = {
         )}</strong>`;
     }
 
-    function renderResourcesCell(intel) {
-        const estimated = calculateEstimatedResources(intel);
+    function renderResourcesCell(intel, distance = 0) {
+        const estimated = calculateEstimatedResources(intel, distance);
         if (!estimated) return '—';
 
         const tooltipParts = [];
@@ -2986,18 +3043,33 @@ window.twSDK = {
                 )}`
             );
             tooltipParts.push(
-                `Tiempo exacto: ${estimated.elapsedHours.toFixed(2)} h`
+                `Antigüedad informe: ${(
+                    estimated.reportAgeHours * 60
+                ).toFixed(1)} min`
             );
             tooltipParts.push(
-                `Velocidad: ${WORLD_GAME_SPEED} · Factor recursos: ${WORLD_RESOURCE_PRODUCTION_FACTOR.toFixed(
-                    6
-                )} · Multiplicador total: ${WORLD_TOTAL_PRODUCTION_MULTIPLIER.toFixed(
-                    6
-                )}`
+                `Viaje ligeras: ${(
+                    estimated.travelHours * 60
+                ).toFixed(1)} min`
             );
             tooltipParts.push(
-                'Bonificación específica del pueblo: no aplicada'
+                `Tiempo hasta llegada: ${(
+                    estimated.elapsedHours * 60
+                ).toFixed(1)} min`
             );
+            tooltipParts.push(
+                `Producción bárbara base: ×${CLASSIC_3_ABANDONED_PRODUCTION_MULTIPLIER}`
+            );
+            if (
+                estimated.hourlyProduction.bonuses &&
+                estimated.hourlyProduction.bonuses.labels.length > 0
+            ) {
+                tooltipParts.push(
+                    `Bonificación: ${estimated.hourlyProduction.bonuses.labels.join(
+                        ', '
+                    )}`
+                );
+            }
         } else {
             tooltipParts.push('Sin niveles productivos: se usa el último dato conocido');
         }
@@ -3013,14 +3085,14 @@ window.twSDK = {
         )} (${twSDK.formatAsNumber(estimated.total)})</span>`;
     }
 
-    function renderStatusCell(intel) {
+    function renderStatusCell(intel, distance = 0) {
         if (!intel) {
             return `<span class="ra-status-neutral">${twSDK.tt(
                 'No report'
             )} · 10 ligeras</span>`;
         }
 
-        const estimated = calculateEstimatedResources(intel);
+        const estimated = calculateEstimatedResources(intel, distance);
 
         if (!estimated) {
             return `<span class="ra-status-neutral">${twSDK.tt(
@@ -3238,7 +3310,16 @@ window.twSDK = {
 
                 const resources = extractScoutedResources(reportHtml);
                 const buildings = extractScoutedBuildings(reportHtml);
+                const resourceBonuses =
+                    extractResourceBonusMultipliers(reportHtml);
+                const exactReportDate =
+                    extractExactReportDateText(reportHtml);
 
+                if (exactReportDate) {
+                    entry.dateText = exactReportDate;
+                }
+
+                entry.resourceBonuses = resourceBonuses;
                 entry.buildings = buildings;
                 entry.wallLevel =
                     buildings && Number.isFinite(Number(buildings.wall))
@@ -3271,6 +3352,7 @@ window.twSDK = {
                     error
                 );
                 entry.resourcesKnown = false;
+                entry.resourceBonuses = null;
                 entry.buildings = null;
                 entry.wallLevel = null;
             }
@@ -3491,6 +3573,127 @@ window.twSDK = {
         return /(?:\d{1,2}[\/.\-]\d{1,2}(?:[\/.\-]\d{2,4})?|\bhoy\b|\bayer\b|\btoday\b|\byesterday\b).*?\d{1,2}:\d{2}|\d{1,2}:\d{2}(?::\d{2})?/i.test(
             value
         );
+    }
+
+    function extractResourceBonusMultipliers(html) {
+        const doc = parseHtmlDocument(html);
+        const $doc = jQuery(doc);
+        const result = {
+            wood: 1,
+            stone: 1,
+            iron: 1,
+            labels: [],
+        };
+
+        const hasBonusClass = (bonusId) =>
+            $doc.find(
+                `.bonus_icon_${bonusId}, [class*="bonus_icon_${bonusId}"]`
+            ).length > 0;
+
+        if (hasBonusClass(1)) {
+            result.wood *= 2;
+            result.labels.push('madera ×2');
+        }
+
+        if (hasBonusClass(2)) {
+            result.stone *= 2;
+            result.labels.push('barro ×2');
+        }
+
+        if (hasBonusClass(3)) {
+            result.iron *= 2;
+            result.labels.push('hierro ×2');
+        }
+
+        if (hasBonusClass(8)) {
+            result.wood *= 1.3;
+            result.stone *= 1.3;
+            result.iron *= 1.3;
+            result.labels.push('todos ×1.3');
+        }
+
+        // Text fallback for layouts that omit the CSS bonus classes.
+        const bonusText = $doc
+            .find('[data-title], [title]')
+            .map(function () {
+                return `${jQuery(this).attr('data-title') || ''} ${
+                    jQuery(this).attr('title') || ''
+                }`;
+            })
+            .get()
+            .join(' ')
+            .normalize('NFD')
+            .replace(/[\u0300-\u036f]/g, '')
+            .toLowerCase();
+
+        if (
+            result.wood === 1 &&
+            /(?:100%|doble|x2).{0,40}(?:madera|lenador)|(?:madera|lenador).{0,40}(?:100%|doble|x2)/i.test(
+                bonusText
+            )
+        ) {
+            result.wood = 2;
+            result.labels.push('madera ×2');
+        }
+
+        if (
+            result.stone === 1 &&
+            /(?:100%|doble|x2).{0,40}(?:barro|arcilla|barrera)|(?:barro|arcilla|barrera).{0,40}(?:100%|doble|x2)/i.test(
+                bonusText
+            )
+        ) {
+            result.stone = 2;
+            result.labels.push('barro ×2');
+        }
+
+        if (
+            result.iron === 1 &&
+            /(?:100%|doble|x2).{0,40}(?:hierro|mina)|(?:hierro|mina).{0,40}(?:100%|doble|x2)/i.test(
+                bonusText
+            )
+        ) {
+            result.iron = 2;
+            result.labels.push('hierro ×2');
+        }
+
+        return result;
+    }
+
+    function extractExactReportDateText(html) {
+        const doc = parseHtmlDocument(html);
+        let exactDate = '';
+
+        const labelPattern =
+            /hora del combate|hora de combate|hora del ataque|hora de llegada|tiempo del combate|battle time|fight time|kampfzeit/i;
+
+        jQuery(doc)
+            .find('tr')
+            .each(function () {
+                if (exactDate) return false;
+
+                const $cells = jQuery(this).find('th, td');
+                if ($cells.length < 2) return;
+
+                const label = normalizeSpaces($cells.eq(0).text());
+                if (!labelPattern.test(label)) return;
+
+                const value = normalizeSpaces(
+                    $cells
+                        .slice(1)
+                        .map(function () {
+                            return jQuery(this).text();
+                        })
+                        .get()
+                        .join(' ')
+                );
+
+                if (looksLikeDateTime(value)) {
+                    exactDate = normalizeReportDateText(value);
+                    return false;
+                }
+            });
+
+        return exactDate;
     }
 
     function extractScoutedBuildings(html) {
@@ -3879,9 +4082,7 @@ window.twSDK = {
     async function fetchWorldRuntimeConfig() {
         const fallback = {
             gameSpeed: 4,
-            baseProduction: 52,
-            resourceProductionFactor: 52 / 30,
-            totalProductionMultiplier: 4 * (52 / 30),
+            unitSpeed: 0.6,
             source: 'Classic 3 fallback',
         };
 
@@ -3896,30 +4097,25 @@ window.twSDK = {
             const gameSpeed = parseFloat(
                 $xml.find('config > speed, speed').first().text()
             );
-            const baseProduction = parseFloat(
+            const unitSpeed = parseFloat(
                 $xml
-                    .find(
-                        'config > game > base_production, game > base_production, base_production'
-                    )
+                    .find('config > unit_speed, unit_speed')
                     .first()
                     .text()
             );
 
             if (
                 !Number.isFinite(gameSpeed) ||
-                !Number.isFinite(baseProduction) ||
+                !Number.isFinite(unitSpeed) ||
                 gameSpeed <= 0 ||
-                baseProduction <= 0
+                unitSpeed <= 0
             ) {
                 return fallback;
             }
 
             return {
                 gameSpeed,
-                baseProduction,
-                resourceProductionFactor: baseProduction / 30,
-                totalProductionMultiplier:
-                    gameSpeed * (baseProduction / 30),
+                unitSpeed,
                 source: 'runtime world config',
             };
         } catch (error) {
