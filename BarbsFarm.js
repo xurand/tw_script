@@ -1,7 +1,7 @@
 /*
  * Script Name: Barbs Finder - ES Farm Intelligence (FORK)
- * Fork Version: v2.5.2-ES-FORK
- * Fork Date: 2026-07-28
+ * Fork Version: v2.6.0-ES-FORK
+ * Fork Date: 2026-07-31
  * Original Project: Barbs Finder v2.0.2
  * Original Author: RedAlert
  * Original Author URL: https://twscripts.dev/
@@ -30,6 +30,10 @@
  * current range. Reset clears the cache. Filter-warning text was removed.
  * v2.5.2 prevents endless pagination when only one report page exists or
  * when the server ignores an invalid from= offset and repeats the same page.
+ * v2.6.0 estimates resources generated since the latest report using the
+ * scouted resource-building levels and the Classic 3 production factor,
+ * displays wall level, changes distance ranges to five-field blocks, and
+ * defaults attacks without a report to 1 scout + 10 light cavalry.
  *
  * IMPORTANT: The original approval applies to the original script/version.
  * This fork must not be assumed to be approved; submit this exact version
@@ -50,7 +54,7 @@ var scriptConfig = {
     scriptData: {
         prefix: 'barbsFinder',
         name: 'Barbs Finder',
-        version: 'v2.5.2-ES-FORK',
+        version: 'v2.6.0-ES-FORK',
         author: 'RedAlert',
         authorUrl: 'https://twscripts.dev/',
         helpLink:
@@ -68,6 +72,7 @@ var scriptConfig = {
                 'Error while fetching "village.txt"!',
             Coords: 'Coords',
             Points: 'Points',
+            'Wall level': 'Wall level',
             'Dist.': 'Dist.',
             Attack: 'Attack',
             Filter: 'Filter',
@@ -81,6 +86,7 @@ var scriptConfig = {
             'Report pages:': 'Report pages:',
             'Latest report': 'Latest report',
             'Scouted resources': 'Scouted resources',
+            'Estimated resources': 'Estimated resources',
             'Light cavalry': 'Light cavalry',
             Status: 'Status',
             'No report': 'No report',
@@ -107,6 +113,7 @@ var scriptConfig = {
                 '¡Error al obtener "village.txt"!',
             Coords: 'Coordenadas',
             Points: 'Puntos',
+            'Wall level': 'Muralla',
             'Dist.': 'Dist.',
             Attack: 'Atacar',
             Filter: 'Filtrar',
@@ -120,6 +127,7 @@ var scriptConfig = {
             'Report pages:': 'Páginas de informes:',
             'Latest report': 'Último ataque',
             'Scouted resources': 'Recursos espiados',
+            'Estimated resources': 'Recursos estimados',
             'Light cavalry': 'Ligeras',
             Status: 'Estado',
             'No report': 'Sin informe',
@@ -2175,6 +2183,7 @@ window.twSDK = {
     const scriptInfo = twSDK.scriptInfo();
 
     const { villages } = await fetchWorldData();
+    const worldRuntimeConfig = await fetchWorldRuntimeConfig();
 
     // Fork state: report information is kept only in memory for this page load.
     // No polling, timers, background listeners or automatic attack actions are used.
@@ -2188,6 +2197,13 @@ window.twSDK = {
     // Official standard carrying capacity of one light cavalry.
     // Scout carrying capacity is 0, so the fixed scout does not affect the calculation.
     const LIGHT_CARRY_CAPACITY = 80;
+    const DEFAULT_LIGHTS_WITHOUT_REPORT = 10;
+
+    // Classic 3 public setting. Runtime config is preferred; this value is the
+    // safe fallback when /interface.php?func=get_config cannot be read.
+    const CLASSIC_3_PRODUCTION_FACTOR = 1.7333333333333;
+    const WORLD_PRODUCTION_FACTOR =
+        worldRuntimeConfig.productionFactor || CLASSIC_3_PRODUCTION_FACTOR;
 
     // Entry point
     try {
@@ -2220,16 +2236,26 @@ window.twSDK = {
                             'Radius:'
                         )}</label>
                         <select id="radius_choser" class="ra-input">
-                            <option value="0|10" selected>0 - 10</option>
-                            <option value="10|20">11 - 20</option>
-                            <option value="20|30">21 - 30</option>
-                            <option value="30|40">31 - 40</option>
-                            <option value="40|50">41 - 50</option>
-                            <option value="50|60">51 - 60</option>
-                            <option value="60|70">61 - 70</option>
-                            <option value="70|80">71 - 80</option>
-                            <option value="80|90">81 - 90</option>
-                            <option value="90|100">91 - 100</option>
+                            <option value="0|5" selected>1 - 5</option>
+                            <option value="5|10">6 - 10</option>
+                            <option value="10|15">11 - 15</option>
+                            <option value="15|20">16 - 20</option>
+                            <option value="20|25">21 - 25</option>
+                            <option value="25|30">26 - 30</option>
+                            <option value="30|35">31 - 35</option>
+                            <option value="35|40">36 - 40</option>
+                            <option value="40|45">41 - 45</option>
+                            <option value="45|50">46 - 50</option>
+                            <option value="50|55">51 - 55</option>
+                            <option value="55|60">56 - 60</option>
+                            <option value="60|65">61 - 65</option>
+                            <option value="65|70">66 - 70</option>
+                            <option value="70|75">71 - 75</option>
+                            <option value="75|80">76 - 80</option>
+                            <option value="80|85">81 - 85</option>
+                            <option value="85|90">86 - 90</option>
+                            <option value="90|95">91 - 95</option>
+                            <option value="95|100">96 - 100</option>
                         </select>
                     </div>
                     <div class="ra-mb15">
@@ -2332,20 +2358,14 @@ window.twSDK = {
                 );
             });
 
-            // Filter by non-overlapping distance range.
-            // First range: 0 <= distance <= 10.
-            // Following ranges: previous limit < distance <= current limit.
-            // This avoids repeating villages when switching from 0-10 to 11-20, etc.
+            // Non-overlapping five-field ranges:
+            // 1-5 means 0 < distance <= 5, 6-10 means 5 < distance <= 10, etc.
             const filteredByRadiusBarbs = filteredBarbs.filter((barbarian) => {
                 const barbCoord = barbarian[2] + '|' + barbarian[3];
                 const distance = twSDK.calculateDistance(
                     currentVillage,
                     barbCoord
                 );
-
-                if (radiusMin === 0) {
-                    return distance >= radiusMin && distance <= radiusMax;
-                }
 
                 return distance > radiusMin && distance <= radiusMax;
             });
@@ -2468,7 +2488,7 @@ window.twSDK = {
             jQuery('#raCurrentVillage').val(game_data.village.coord);
             jQuery('#minPoints').val(26);
             jQuery('#maxPoints').val(12154);
-            jQuery('#radius_choser').val('0|10');
+            jQuery('#radius_choser').val('0|5');
             jQuery('#barbsCount').text('0');
             jQuery('#barbCoordsList').text('');
             jQuery('#barbScoutScript').val('');
@@ -2521,14 +2541,11 @@ window.twSDK = {
                                 #
                             </th>
                             <th>
-                                K
-                            </th>
-                            <th>
                                 ${twSDK.tt('Coords')}
                             </th>
                             <th>
-                                ${twSDK.tt('Points')}
-                            </td>
+                                ${twSDK.tt('Wall level')}
+                            </th>
                             <th>
                                 ${twSDK.tt('Dist.')}
                             </th>
@@ -2536,10 +2553,7 @@ window.twSDK = {
                                 ${twSDK.tt('Latest report')}
                             </th>
                             <th>
-                                ${twSDK.tt('Scouted resources')}
-                            </th>
-                            <th>
-                                ${twSDK.tt('Light cavalry')}
+                                ${twSDK.tt('Estimated resources')}
                             </th>
                             <th>
                                 ${twSDK.tt('Status')}
@@ -2564,10 +2578,10 @@ window.twSDK = {
 
         barbs.forEach((barb, index) => {
             index++;
-            const continent = barb[3].charAt(0) + barb[2].charAt(0);
             const coord = `${barb[2]}|${barb[3]}`;
             const intel = intelByCoord[coord];
             const reportCell = renderLatestReportCell(intel);
+            const wallCell = renderWallLevelCell(intel);
             const resourcesCell = renderResourcesCell(intel);
             const lightNeeded = calculateLightCavalryNeeded(intel);
             const statusCell = renderStatusCell(intel);
@@ -2578,20 +2592,16 @@ window.twSDK = {
                             ${index}
                         </td>
                         <td class="ra-tac">
-                            ${continent}
-                        </td>
-                        <td class="ra-tac">
                             <a href="game.php?screen=info_village&id=${
                                 barb[0]
                             }" target="_blank" rel="noopener noreferrer">
                                 ${coord}
                             </a>
                         </td>
-                        <td>${twSDK.formatAsNumber(barb[5])}</td>
+                        <td class="ra-tac">${wallCell}</td>
                         <td class="ra-tac">${barb[7].toFixed(2)}</td>
                         <td class="ra-tac">${reportCell}</td>
                         <td class="ra-tac ra-resources">${resourcesCell}</td>
-                        <td class="ra-tac"><strong>${lightNeeded}</strong></td>
                         <td class="ra-tac">${statusCell}</td>
                         <td class="ra-tac">
                             <a href="/game.php?screen=place&target=${
@@ -2609,16 +2619,20 @@ window.twSDK = {
 
 
     function calculateLightCavalryNeeded(intel) {
-        if (
-            !intel ||
-            !intel.resourcesKnown ||
-            !intel.resources ||
-            !Number.isFinite(Number(intel.resources.total))
-        ) {
-            return 0;
+        // Explicit user requirement: no report => 10 light cavalry.
+        if (!intel) {
+            return DEFAULT_LIGHTS_WITHOUT_REPORT;
         }
 
-        const totalResources = Math.max(0, Number(intel.resources.total));
+        const estimated = calculateEstimatedResources(intel);
+
+        // A report exists but its resource/building data could not be read.
+        // Keep a practical fallback instead of generating an empty attack.
+        if (!estimated || !Number.isFinite(Number(estimated.total))) {
+            return DEFAULT_LIGHTS_WITHOUT_REPORT;
+        }
+
+        const totalResources = Math.max(0, Number(estimated.total));
 
         if (totalResources === 0) {
             return 0;
@@ -2626,6 +2640,123 @@ window.twSDK = {
 
         return Math.ceil(totalResources / LIGHT_CARRY_CAPACITY);
     }
+
+    function calculateEstimatedResources(intel) {
+        if (
+            !intel ||
+            !intel.resourcesKnown ||
+            !intel.resources ||
+            !Number.isFinite(Number(intel.resources.total))
+        ) {
+            return null;
+        }
+
+        const reportDate = parseReportDate(intel.dateText);
+        const production = calculateHourlyProduction(
+            intel.buildings,
+            intel.villageType
+        );
+
+        // If the building levels or report time are unavailable, retain the
+        // exact last-known resources rather than inventing production.
+        if (!reportDate || !production) {
+            return {
+                wood: Math.max(0, Number(intel.resources.wood) || 0),
+                stone: Math.max(0, Number(intel.resources.stone) || 0),
+                iron: Math.max(0, Number(intel.resources.iron) || 0),
+                total: Math.max(0, Number(intel.resources.total) || 0),
+                elapsedHours: 0,
+                productionKnown: false,
+                hourlyProduction: null,
+            };
+        }
+
+        const now = twSDK.getServerDateTimeObject();
+        const elapsedHours = Math.max(
+            0,
+            (now.getTime() - reportDate.getTime()) / (1000 * 60 * 60)
+        );
+
+        const estimated = {
+            wood: Math.floor(
+                Math.max(0, Number(intel.resources.wood) || 0) +
+                    production.wood * elapsedHours
+            ),
+            stone: Math.floor(
+                Math.max(0, Number(intel.resources.stone) || 0) +
+                    production.stone * elapsedHours
+            ),
+            iron: Math.floor(
+                Math.max(0, Number(intel.resources.iron) || 0) +
+                    production.iron * elapsedHours
+            ),
+            elapsedHours,
+            productionKnown: true,
+            hourlyProduction: production,
+        };
+
+        estimated.total = estimated.wood + estimated.stone + estimated.iron;
+        return estimated;
+    }
+
+    function calculateHourlyProduction(buildings, villageType = 0) {
+        if (!buildings) return null;
+
+        const woodLevel = normalizeBuildingLevel(buildings.wood);
+        const stoneLevel = normalizeBuildingLevel(buildings.stone);
+        const ironLevel = normalizeBuildingLevel(buildings.iron);
+
+        if (
+            woodLevel === null ||
+            stoneLevel === null ||
+            ironLevel === null
+        ) {
+            return null;
+        }
+
+        const production = {
+            wood:
+                getBaseResourceProduction(woodLevel) *
+                WORLD_PRODUCTION_FACTOR,
+            stone:
+                getBaseResourceProduction(stoneLevel) *
+                WORLD_PRODUCTION_FACTOR,
+            iron:
+                getBaseResourceProduction(ironLevel) *
+                WORLD_PRODUCTION_FACTOR,
+        };
+
+        // Tribal Wars village.txt bonus IDs used by resource bonus villages.
+        const bonusType = Number(villageType) || 0;
+        if (bonusType === 1) production.wood *= 2;
+        if (bonusType === 2) production.stone *= 2;
+        if (bonusType === 3) production.iron *= 2;
+        if (bonusType === 8) {
+            production.wood *= 1.3;
+            production.stone *= 1.3;
+            production.iron *= 1.3;
+        }
+
+        production.wood = Math.round(production.wood);
+        production.stone = Math.round(production.stone);
+        production.iron = Math.round(production.iron);
+        production.total =
+            production.wood + production.stone + production.iron;
+
+        return production;
+    }
+
+    function getBaseResourceProduction(level) {
+        const normalizedLevel = Math.max(0, Math.min(30, Number(level) || 0));
+        return Number(twSDK.resPerHour[normalizedLevel]) || 0;
+    }
+
+    function normalizeBuildingLevel(value) {
+        const level = Number(value);
+        if (!Number.isFinite(level) || level < 0) return null;
+        return Math.max(0, Math.min(30, Math.floor(level)));
+    }
+
 
     function generateSequentialScoutScript(barbs, intelByCoord = {}) {
         const targets = barbs.map((barb) => {
@@ -2781,29 +2912,88 @@ window.twSDK = {
         return null;
     }
 
+    function renderWallLevelCell(intel) {
+        if (
+            !intel ||
+            !Number.isFinite(Number(intel.wallLevel))
+        ) {
+            return '—';
+        }
+
+        return `<strong>${Math.max(
+            0,
+            Math.min(20, Math.floor(Number(intel.wallLevel)))
+        )}</strong>`;
+    }
+
     function renderResourcesCell(intel) {
-        if (!intel || !intel.resourcesKnown) return '—';
-        const { wood, stone, iron, total } = intel.resources;
-        return `${twSDK.formatAsNumber(wood)} / ${twSDK.formatAsNumber(
-            stone
-        )} / ${twSDK.formatAsNumber(iron)} (${twSDK.formatAsNumber(total)})`;
+        const estimated = calculateEstimatedResources(intel);
+        if (!estimated) return '—';
+
+        const tooltipParts = [];
+
+        if (intel && intel.resourcesKnown) {
+            tooltipParts.push(
+                `Informe: ${twSDK.formatAsNumber(
+                    intel.resources.wood
+                )} / ${twSDK.formatAsNumber(
+                    intel.resources.stone
+                )} / ${twSDK.formatAsNumber(intel.resources.iron)}`
+            );
+        }
+
+        if (estimated.productionKnown && estimated.hourlyProduction) {
+            tooltipParts.push(
+                `Producción/h: ${twSDK.formatAsNumber(
+                    estimated.hourlyProduction.wood
+                )} / ${twSDK.formatAsNumber(
+                    estimated.hourlyProduction.stone
+                )} / ${twSDK.formatAsNumber(
+                    estimated.hourlyProduction.iron
+                )}`
+            );
+            tooltipParts.push(
+                `Tiempo: ${estimated.elapsedHours.toFixed(2)} h`
+            );
+        } else {
+            tooltipParts.push('Sin niveles productivos: se usa el último dato conocido');
+        }
+
+        const title = escapeHtml(tooltipParts.join(' · '));
+
+        return `<span title="${title}">${twSDK.formatAsNumber(
+            estimated.wood
+        )} / ${twSDK.formatAsNumber(
+            estimated.stone
+        )} / ${twSDK.formatAsNumber(
+            estimated.iron
+        )} (${twSDK.formatAsNumber(estimated.total)})</span>`;
     }
 
     function renderStatusCell(intel) {
         if (!intel) {
-            return `<span class="ra-status-neutral">${twSDK.tt('No report')}</span>`;
+            return `<span class="ra-status-neutral">${twSDK.tt(
+                'No report'
+            )} · 10 ligeras</span>`;
         }
-        if (!intel.resourcesKnown) {
+
+        const estimated = calculateEstimatedResources(intel);
+
+        if (!estimated) {
             return `<span class="ra-status-neutral">${twSDK.tt(
                 'No scout data'
             )}</span>`;
         }
-        if (intel.resources.total > 0) {
+
+        if (estimated.total > 0) {
             return `<span class="ra-status-good">${twSDK.tt(
                 'Resources detected'
             )}</span>`;
         }
-        return `<span class="ra-status-empty">${twSDK.tt('No resources')}</span>`;
+
+        return `<span class="ra-status-empty">${twSDK.tt(
+            'No resources'
+        )}</span>`;
     }
 
     function bindAttackButtonVisualState() {
@@ -2822,6 +3012,15 @@ window.twSDK = {
     async function fetchLatestReportIntel(barbs) {
         const targetCoords = new Set(
             barbs.map((barb) => `${barb[2]}|${barb[3]}`)
+        );
+        const targetVillageMeta = new Map(
+            barbs.map((barb) => [
+                `${barb[2]}|${barb[3]}`,
+                {
+                    villageId: Number(barb[0]) || 0,
+                    villageType: Number(barb[6]) || 0,
+                },
+            ])
         );
         const latestByCoord = {};
         const seenReportIds = new Set();
@@ -2905,7 +3104,12 @@ window.twSDK = {
             // coordinate is its latest report; older pages cannot replace it.
             pageData.entries.forEach((entry) => {
                 if (!latestByCoord[entry.coord]) {
-                    latestByCoord[entry.coord] = entry;
+                    const targetMeta = targetVillageMeta.get(entry.coord) || {};
+                    latestByCoord[entry.coord] = {
+                        ...entry,
+                        villageId: targetMeta.villageId || 0,
+                        villageType: targetMeta.villageType || 0,
+                    };
                 }
             });
 
@@ -2992,6 +3196,13 @@ window.twSDK = {
                 });
 
                 const resources = extractScoutedResources(reportHtml);
+                const buildings = extractScoutedBuildings(reportHtml);
+
+                entry.buildings = buildings;
+                entry.wallLevel =
+                    buildings && Number.isFinite(Number(buildings.wall))
+                        ? Number(buildings.wall)
+                        : null;
 
                 if (resources !== null) {
                     entry.resources = resources;
@@ -3019,6 +3230,8 @@ window.twSDK = {
                     error
                 );
                 entry.resourcesKnown = false;
+                entry.buildings = null;
+                entry.wallLevel = null;
             }
         }
 
@@ -3239,6 +3452,140 @@ window.twSDK = {
         );
     }
 
+    function extractScoutedBuildings(html) {
+        const doc = parseHtmlDocument(html);
+        const dataElement = doc.getElementById('attack_spy_building_data');
+
+        if (dataElement) {
+            const rawValue =
+                dataElement.value ||
+                dataElement.getAttribute('value') ||
+                dataElement.textContent ||
+                '';
+
+            try {
+                const parsed = JSON.parse(rawValue);
+                const normalized = normalizeScoutedBuildingData(parsed);
+                if (Object.keys(normalized).length > 0) {
+                    return normalized;
+                }
+            } catch (error) {
+                console.warn(
+                    `${scriptInfo} Could not parse attack_spy_building_data:`,
+                    error
+                );
+            }
+        }
+
+        // Fallback for layouts that render building rows without the JSON input.
+        const result = {};
+        const aliases = {
+            wood: ['wood', 'timber', 'leñador', 'lenador', 'madera'],
+            stone: ['stone', 'clay', 'barrera', 'barro', 'arcilla'],
+            iron: ['iron', 'mina de hierro', 'hierro'],
+            wall: ['wall', 'muralla'],
+            storage: ['storage', 'warehouse', 'almacen', 'almacén'],
+        };
+
+        jQuery(doc)
+            .find(
+                '#attack_spy_buildings tr, .attack_spy_buildings tr, tr, .vis_item'
+            )
+            .each(function () {
+                const $row = jQuery(this);
+                const descriptor = normalizeSpaces(
+                    `${$row.text()} ${$row.html() || ''}`
+                )
+                    .normalize('NFD')
+                    .replace(/[\u0300-\u036f]/g, '')
+                    .toLowerCase();
+
+                const levelMatch =
+                    descriptor.match(
+                        /(?:nivel|level)\s*[:\-]?\s*(\d{1,2})/i
+                    ) ||
+                    descriptor.match(/\b(\d{1,2})\b(?!.*\b\d{1,2}\b)/);
+
+                if (!levelMatch) return;
+                const level = parseInt(levelMatch[1], 10);
+                if (!Number.isFinite(level)) return;
+
+                for (const [buildingId, names] of Object.entries(aliases)) {
+                    if (
+                        result[buildingId] === undefined &&
+                        names.some((name) => descriptor.includes(name))
+                    ) {
+                        result[buildingId] = level;
+                        break;
+                    }
+                }
+            });
+
+        return Object.keys(result).length > 0 ? result : null;
+    }
+
+    function normalizeScoutedBuildingData(value) {
+        const result = {};
+        const items = Array.isArray(value)
+            ? value
+            : Array.isArray(value && value.buildings)
+            ? value.buildings
+            : value && typeof value === 'object'
+            ? Object.entries(value).map(([id, level]) => ({ id, level }))
+            : [];
+
+        items.forEach((building) => {
+            if (!building) return;
+
+            const id = String(
+                building.id ||
+                    building.building ||
+                    building.name ||
+                    ''
+            ).toLowerCase();
+            const level = parseInt(
+                building.level ??
+                    building.value ??
+                    building.current ??
+                    building[1],
+                10
+            );
+
+            if (!id || !Number.isFinite(level)) return;
+
+            const normalizedId = normalizeBuildingId(id);
+            if (normalizedId) {
+                result[normalizedId] = level;
+            }
+        });
+
+        return result;
+    }
+
+    function normalizeBuildingId(value) {
+        const id = String(value || '')
+            .normalize('NFD')
+            .replace(/[\u0300-\u036f]/g, '')
+            .toLowerCase()
+            .trim();
+
+        const mapping = {
+            wood: 'wood',
+            timber: 'wood',
+            timber_camp: 'wood',
+            stone: 'stone',
+            clay: 'stone',
+            clay_pit: 'stone',
+            iron: 'iron',
+            iron_mine: 'iron',
+            wall: 'wall',
+            storage: 'storage',
+            warehouse: 'storage',
+        };
+
+        return mapping[id] || null;
+    }
+
     function extractScoutedResources(html) {
         const doc = parseHtmlDocument(html);
         const $doc = jQuery(doc);
@@ -3433,6 +3780,55 @@ window.twSDK = {
 
     function sleep(ms) {
         return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    async function fetchWorldRuntimeConfig() {
+        const fallback = {
+            productionFactor: 1.7333333333333,
+            source: 'Classic 3 fallback',
+        };
+
+        try {
+            const response = await jQuery.ajax({
+                url: '/interface.php?func=get_config',
+                method: 'GET',
+                dataType: 'xml',
+            });
+
+            const $xml = jQuery(response);
+            const speed = parseFloat(
+                $xml.find('config > speed, speed').first().text()
+            );
+            const baseProduction = parseFloat(
+                $xml
+                    .find(
+                        'config > game > base_production, game > base_production, base_production'
+                    )
+                    .first()
+                    .text()
+            );
+
+            // Standard level-1 production is 30/h. The public world settings
+            // express production as a multiplier of that standard value.
+            const productionFactor =
+                Number.isFinite(speed) &&
+                Number.isFinite(baseProduction) &&
+                speed > 0 &&
+                baseProduction > 0
+                    ? (speed * baseProduction) / 30
+                    : fallback.productionFactor;
+
+            return {
+                productionFactor,
+                source: 'runtime world config',
+            };
+        } catch (error) {
+            console.warn(
+                `${scriptInfo} Could not read world config; using Classic 3 fallback.`,
+                error
+            );
+            return fallback;
+        }
     }
 
     // Helper: Fetch all required world data
