@@ -1,6 +1,6 @@
 /*
  * Script Name: Barbs Finder - ES Farm Intelligence (FORK)
- * Fork Version: v2.6.0-ES-FORK
+ * Fork Version: v2.6.1-ES-FORK
  * Fork Date: 2026-07-31
  * Original Project: Barbs Finder v2.0.2
  * Original Author: RedAlert
@@ -34,6 +34,10 @@
  * scouted resource-building levels and the Classic 3 production factor,
  * displays wall level, changes distance ranges to five-field blocks, and
  * defaults attacks without a report to 1 scout + 10 light cavalry.
+ * v2.6.1 corrects Classic 3 production: game speed (4) and resource
+ * production factor (52/30 = 1.733333...) are both applied. It also reads
+ * resources directly from #attack_spy_resources to avoid confusing loot
+ * with the resources revealed by espionage.
  *
  * IMPORTANT: The original approval applies to the original script/version.
  * This fork must not be assumed to be approved; submit this exact version
@@ -54,7 +58,7 @@ var scriptConfig = {
     scriptData: {
         prefix: 'barbsFinder',
         name: 'Barbs Finder',
-        version: 'v2.6.0-ES-FORK',
+        version: 'v2.6.1-ES-FORK',
         author: 'RedAlert',
         authorUrl: 'https://twscripts.dev/',
         helpLink:
@@ -2199,11 +2203,21 @@ window.twSDK = {
     const LIGHT_CARRY_CAPACITY = 80;
     const DEFAULT_LIGHTS_WITHOUT_REPORT = 10;
 
-    // Classic 3 public setting. Runtime config is preferred; this value is the
-    // safe fallback when /interface.php?func=get_config cannot be read.
-    const CLASSIC_3_PRODUCTION_FACTOR = 1.7333333333333;
-    const WORLD_PRODUCTION_FACTOR =
-        worldRuntimeConfig.productionFactor || CLASSIC_3_PRODUCTION_FACTOR;
+    // Classic 3 public settings. Runtime configuration is preferred.
+    // Resource factor 1.733333... is NOT the complete multiplier:
+    // total multiplier = game speed 4 * resource factor 1.733333... = 6.933333...
+    const CLASSIC_3_GAME_SPEED = 4;
+    const CLASSIC_3_BASE_PRODUCTION = 52;
+    const STANDARD_BASE_PRODUCTION = 30;
+
+    const WORLD_GAME_SPEED =
+        worldRuntimeConfig.gameSpeed || CLASSIC_3_GAME_SPEED;
+    const WORLD_BASE_PRODUCTION =
+        worldRuntimeConfig.baseProduction || CLASSIC_3_BASE_PRODUCTION;
+    const WORLD_RESOURCE_PRODUCTION_FACTOR =
+        WORLD_BASE_PRODUCTION / STANDARD_BASE_PRODUCTION;
+    const WORLD_TOTAL_PRODUCTION_MULTIPLIER =
+        WORLD_GAME_SPEED * WORLD_RESOURCE_PRODUCTION_FACTOR;
 
     // Entry point
     try {
@@ -2214,6 +2228,16 @@ window.twSDK = {
         handleFilterBarbs();
         handleResetFilters();
         handleUpdateReports();
+
+        console.info(`${scriptInfo} Production configuration`, {
+            gameSpeed: WORLD_GAME_SPEED,
+            baseProduction: WORLD_BASE_PRODUCTION,
+            resourceProductionFactor:
+                WORLD_RESOURCE_PRODUCTION_FACTOR,
+            totalProductionMultiplier:
+                WORLD_TOTAL_PRODUCTION_MULTIPLIER,
+            source: worldRuntimeConfig.source,
+        });
     } catch (error) {
         UI.ErrorMessage(twSDK.tt('There was an error!'));
         console.error(`${scriptInfo} Error:`, error);
@@ -2715,15 +2739,9 @@ window.twSDK = {
         }
 
         const production = {
-            wood:
-                getBaseResourceProduction(woodLevel) *
-                WORLD_PRODUCTION_FACTOR,
-            stone:
-                getBaseResourceProduction(stoneLevel) *
-                WORLD_PRODUCTION_FACTOR,
-            iron:
-                getBaseResourceProduction(ironLevel) *
-                WORLD_PRODUCTION_FACTOR,
+            wood: calculateResourceBuildingProduction(woodLevel),
+            stone: calculateResourceBuildingProduction(stoneLevel),
+            iron: calculateResourceBuildingProduction(ironLevel),
         };
 
         // Tribal Wars village.txt bonus IDs used by resource bonus villages.
@@ -2746,9 +2764,27 @@ window.twSDK = {
         return production;
     }
 
-    function getBaseResourceProduction(level) {
-        const normalizedLevel = Math.max(0, Math.min(30, Number(level) || 0));
-        return Number(twSDK.resPerHour[normalizedLevel]) || 0;
+    function calculateResourceBuildingProduction(level) {
+        const normalizedLevel = Math.max(
+            0,
+            Math.min(30, Number(level) || 0)
+        );
+
+        // Resource building level 0 uses the legacy base table value.
+        if (normalizedLevel === 0) {
+            return Math.round(
+                (Number(twSDK.resPerHour[0]) || 0) *
+                    WORLD_TOTAL_PRODUCTION_MULTIPLIER
+            );
+        }
+
+        // Official Tribal Wars production curve:
+        // round(1.163118^(level - 1) * world speed * base production).
+        return Math.round(
+            Math.pow(1.163118, normalizedLevel - 1) *
+                WORLD_GAME_SPEED *
+                WORLD_BASE_PRODUCTION
+        );
     }
 
     function normalizeBuildingLevel(value) {
@@ -2953,7 +2989,14 @@ window.twSDK = {
                 )}`
             );
             tooltipParts.push(
-                `Tiempo: ${estimated.elapsedHours.toFixed(2)} h`
+                `Tiempo exacto: ${estimated.elapsedHours.toFixed(2)} h`
+            );
+            tooltipParts.push(
+                `Velocidad: ${WORLD_GAME_SPEED} · Factor recursos: ${WORLD_RESOURCE_PRODUCTION_FACTOR.toFixed(
+                    6
+                )} · Multiplicador total: ${WORLD_TOTAL_PRODUCTION_MULTIPLIER.toFixed(
+                    6
+                )}`
             );
         } else {
             tooltipParts.push('Sin niveles productivos: se usa el último dato conocido');
@@ -3589,8 +3632,37 @@ window.twSDK = {
     function extractScoutedResources(html) {
         const doc = parseHtmlDocument(html);
         const $doc = jQuery(doc);
+
+        // Primary and reliable source used by the game report:
+        // this row contains "Recursos espiados" and is separate from "Botín".
+        const $exactSpyRow = $doc.find('#attack_spy_resources td').first();
+
+        if ($exactSpyRow.length) {
+            const iconResources = extractResourcesFromContainer($exactSpyRow);
+            if (iconResources !== null) {
+                return iconResources;
+            }
+
+            const textResources = extractThreeResourceAmounts(
+                $exactSpyRow.text()
+            );
+            if (textResources !== null) {
+                return textResources;
+            }
+
+            if (isExplicitZeroResourceText($exactSpyRow.text())) {
+                return {
+                    wood: 0,
+                    stone: 0,
+                    iron: 0,
+                    total: 0,
+                };
+            }
+        }
+
         let bestCandidate = null;
 
+        // Compatibility fallback for old/alternate layouts only.
         // Inspect report rows and compact blocks. Do not inspect the entire page as
         // one container because loot tooltips also contain wood/stone/iron icons.
         $doc.find('tr, .report_ReportAttack, .report-result, .vis_item').each(
@@ -3655,6 +3727,30 @@ window.twSDK = {
         );
 
         return bestCandidate ? bestCandidate.resources : null;
+    }
+
+    function extractThreeResourceAmounts(value) {
+        const text = normalizeSpaces(value);
+        if (!text) return null;
+
+        // Thousands separators may be dots, spaces or non-breaking spaces.
+        const matches = text.match(/\d(?:[\d.\s\u00a0]*\d)?/g);
+        if (!matches || matches.length < 3) return null;
+
+        const amounts = matches
+            .slice(0, 3)
+            .map((item) => parseGameNumber(item));
+
+        if (amounts.some((amount) => amount === null)) {
+            return null;
+        }
+
+        return {
+            wood: amounts[0],
+            stone: amounts[1],
+            iron: amounts[2],
+            total: amounts[0] + amounts[1] + amounts[2],
+        };
     }
 
     function extractResourcesFromContainer($container) {
@@ -3784,7 +3880,10 @@ window.twSDK = {
 
     async function fetchWorldRuntimeConfig() {
         const fallback = {
-            productionFactor: 1.7333333333333,
+            gameSpeed: 4,
+            baseProduction: 52,
+            resourceProductionFactor: 52 / 30,
+            totalProductionMultiplier: 4 * (52 / 30),
             source: 'Classic 3 fallback',
         };
 
@@ -3796,7 +3895,7 @@ window.twSDK = {
             });
 
             const $xml = jQuery(response);
-            const speed = parseFloat(
+            const gameSpeed = parseFloat(
                 $xml.find('config > speed, speed').first().text()
             );
             const baseProduction = parseFloat(
@@ -3808,18 +3907,21 @@ window.twSDK = {
                     .text()
             );
 
-            // Standard level-1 production is 30/h. The public world settings
-            // express production as a multiplier of that standard value.
-            const productionFactor =
-                Number.isFinite(speed) &&
-                Number.isFinite(baseProduction) &&
-                speed > 0 &&
-                baseProduction > 0
-                    ? (speed * baseProduction) / 30
-                    : fallback.productionFactor;
+            if (
+                !Number.isFinite(gameSpeed) ||
+                !Number.isFinite(baseProduction) ||
+                gameSpeed <= 0 ||
+                baseProduction <= 0
+            ) {
+                return fallback;
+            }
 
             return {
-                productionFactor,
+                gameSpeed,
+                baseProduction,
+                resourceProductionFactor: baseProduction / 30,
+                totalProductionMultiplier:
+                    gameSpeed * (baseProduction / 30),
                 source: 'runtime world config',
             };
         } catch (error) {
