@@ -1,6 +1,6 @@
 /*
  * Script Name: Barbs Finder - ES Farm Intelligence (FORK)
- * Fork Version: v2.6.3-ES-FORK
+ * Fork Version: v2.6.4-ES-FORK
  * Fork Date: 2026-07-31
  * Original Project: Barbs Finder v2.0.2
  * Original Author: RedAlert
@@ -44,6 +44,9 @@
  * v2.6.3 uses the effective Classic 3 abandoned-village production observed
  * in consecutive reports (2x the standard resPerHour table), reads the real
  * report bonus icons, and estimates resources at light-cavalry arrival time.
+ * v2.6.4 treats resource buildings omitted from a successfully scouted
+ * building list as level 0 and recognizes Spanish 'ningún' as confirmed
+ * zero resources, allowing regeneration to be calculated from zero.
  *
  * IMPORTANT: The original approval applies to the original script/version.
  * This fork must not be assumed to be approved; submit this exact version
@@ -64,7 +67,7 @@ var scriptConfig = {
     scriptData: {
         prefix: 'barbsFinder',
         name: 'Barbs Finder',
-        version: 'v2.6.3-ES-FORK',
+        version: 'v2.6.4-ES-FORK',
         author: 'RedAlert',
         authorUrl: 'https://twscripts.dev/',
         helpLink:
@@ -3060,6 +3063,15 @@ window.twSDK = {
             tooltipParts.push(
                 `Producción bárbara base: ×${CLASSIC_3_ABANDONED_PRODUCTION_MULTIPLIER}`
             );
+            tooltipParts.push(
+                `Niveles: Leñador ${Number(
+                    intel.buildings && intel.buildings.wood
+                ) || 0}, Barrera ${Number(
+                    intel.buildings && intel.buildings.stone
+                ) || 0}, Mina ${Number(
+                    intel.buildings && intel.buildings.iron
+                ) || 0}`
+            );
             if (
                 estimated.hourlyProduction.bonuses &&
                 estimated.hourlyProduction.bonuses.labels.length > 0
@@ -3711,7 +3723,7 @@ window.twSDK = {
                 const parsed = JSON.parse(rawValue);
                 const normalized = normalizeScoutedBuildingData(parsed);
                 if (Object.keys(normalized).length > 0) {
-                    return normalized;
+                    return completeScoutedBuildingLevels(normalized);
                 }
             } catch (error) {
                 console.warn(
@@ -3765,7 +3777,34 @@ window.twSDK = {
                 }
             });
 
-        return Object.keys(result).length > 0 ? result : null;
+        return Object.keys(result).length > 0
+            ? completeScoutedBuildingLevels(result)
+            : null;
+    }
+
+    function completeScoutedBuildingLevels(buildings) {
+        if (!buildings || typeof buildings !== 'object') {
+            return null;
+        }
+
+        const completed = {
+            ...buildings,
+        };
+
+        // In Tribal Wars espionage reports, level-0 buildings are omitted from
+        // the visible list/JSON. Once the building section is available, a
+        // missing resource building therefore means level 0, not unknown.
+        ['wood', 'stone', 'iron', 'wall'].forEach((buildingId) => {
+            if (
+                completed[buildingId] === undefined ||
+                completed[buildingId] === null ||
+                completed[buildingId] === ''
+            ) {
+                completed[buildingId] = 0;
+            }
+        });
+
+        return completed;
     }
 
     function normalizeScoutedBuildingData(value) {
@@ -3836,7 +3875,9 @@ window.twSDK = {
 
         // Primary and reliable source used by the game report:
         // this row contains "Recursos espiados" and is separate from "Botín".
-        const $exactSpyRow = $doc.find('#attack_spy_resources td').first();
+        const $exactSpyRow = $doc
+            .find('#attack_spy_resources')
+            .first();
 
         if ($exactSpyRow.length) {
             const iconResources = extractResourcesFromContainer($exactSpyRow);
@@ -4027,8 +4068,25 @@ window.twSDK = {
     }
 
     function isExplicitZeroResourceText(value) {
-        const text = normalizeSpaces(value)
-            .replace(/recursos|resources|madera|barro|arcilla|hierro|wood|stone|clay|iron/gi, ' ')
+        const normalized = normalizeSpaces(value)
+            .normalize('NFD')
+            .replace(/[\u0300-\u036f]/g, '')
+            .toLowerCase();
+
+        // Spanish reports use "ningún" when all three scouted resources are 0.
+        if (
+            /\bningun(?:o|a)?\b|\bsin recursos\b|\bno resources?\b|\bnone\b/.test(
+                normalized
+            )
+        ) {
+            return true;
+        }
+
+        const text = normalized
+            .replace(
+                /recursos|resources|madera|barro|arcilla|hierro|wood|stone|clay|iron/gi,
+                ' '
+            )
             .trim();
 
         // Require at least one explicit zero and reject any positive digit.
